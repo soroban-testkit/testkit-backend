@@ -110,9 +110,12 @@ soroban-testkit audit ./src --format sarif > audit.sarif
 ```
 
 `limits` ramps numeric and `Bytes` parameters directly, or ramps a `Vec<T>`
-by element count. Use repeated `--arg NAME=VALUE` options for non-ramped
-scalar values; `Bytes` overrides use `0x`-prefixed hex. The command refines
-the first failing ramp value with binary search.
+by element count. `--ramp` must exactly match an input name in the selected
+function's contract ABI. An unknown name is rejected before probes run or
+reports are written, with the available inputs listed for recovery.
+Use repeated `--arg NAME=VALUE` options for non-ramped scalar values;
+`Bytes` overrides use `0x`-prefixed hex. The command refines the first
+failing ramp value with binary search.
 Every ramp attempt runs in its own subprocess: a real `.wasm` contract
 that exceeds resource limits can abort the process outright rather than
 return an error, and isolating each attempt is the only safe way to probe
@@ -133,10 +136,13 @@ reproduction instructions shell-quote paths containing spaces or quotes.
 
 `audit` accepts three scan roots: a crate directory (walked recursively for
 `.rs` files), a single `.rs` file, or `-` to read Rust source from stdin.
-While walking a directory it skips `target/`, `node_modules/`, and hidden
-directories such as `.git/` and `.github/`, so build output and vendored or
-tooling code is never reported. A path that doesn't exist is an actionable
-error rather than an empty "no findings" run.
+While walking a directory it skips `target/`, `vendor/`, `node_modules/`,
+and hidden directories such as `.git/` and `.github/`, keeping build output
+and dependency trees out of recursive scans. A missing path is an actionable
+error rather than an empty "no findings" run. An explicitly selected excluded
+directory or single file is still scanned. Empty, whitespace-only, and
+comment-only Rust files are valid inputs with no findings. Raw identifiers
+such as `r#amount` are checked the same way as their ordinary spellings.
 
 Findings use paths relative to the Cargo workspace root (or the repository
 root or crate root when there is no workspace). The nearest

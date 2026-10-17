@@ -262,7 +262,8 @@ pub struct LimitsArgs {
     /// The contract function to ramp.
     #[arg(long = "fn", value_name = "NAME")]
     function: String,
-    /// The parameter to increase on each attempt.
+    /// The parameter to increase on each attempt. Must exactly match an input
+    /// name in the selected function's contract ABI; checked before probing.
     #[arg(long, value_name = "PARAM")]
     ramp: String,
     /// Explicit value for a non-ramped parameter, as NAME=VALUE. Repeatable.
@@ -1256,10 +1257,20 @@ fn load(
                 .iter()
                 .map(|p| p.name.to_utf8_string_lossy().to_string())
                 .collect();
+            let (available, guidance) = if param_names.is_empty() {
+                (
+                    "(none)".to_string(),
+                    "choose a function with a numeric, Bytes, or Vec parameter using --fn",
+                )
+            } else {
+                (
+                    param_names.join(", "),
+                    "set --ramp to an input name from the selected function's contract ABI",
+                )
+            };
             CliError(format!(
                 "{function:?} has no parameter named {ramp:?}; \
-                 available parameters: {}",
-                param_names.join(", ")
+                 available parameters: {available}; {guidance}"
             ))
         })?;
 

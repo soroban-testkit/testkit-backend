@@ -4,8 +4,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
+use proc_macro2::{Group, TokenStream, TokenTree};
 use quote::ToTokens;
 use serde::{Deserialize, Serialize};
+use syn::ext::IdentExt;
 use syn::visit::{self, Visit};
 use syn::{BinOp, Expr, FnArg, ImplItemFn, ItemFn, Local, Pat, Signature, Type};
 use walkdir::WalkDir;
@@ -31,10 +33,12 @@ pub struct AuditArgs {
     /// - `-`: read Rust source from stdin.
     ///
     /// While scanning a directory these are excluded (skipped, never
-    /// descended into): `target/`, `node_modules/`, and any hidden directory
-    /// (its name begins with `.`, e.g. `.git/`, `.github/`, `.cargo/`). A
+    /// descended into): `target/`, `vendor/`, `node_modules/`, and any hidden
+    /// directory (its name begins with `.`, e.g. `.git/`, `.github/`, `.cargo/`). A
     /// missing path is reported as an actionable error rather than an empty
-    /// "no findings" result.
+    /// "no findings" result. Explicitly selecting an excluded directory or
+    /// one of its files still scans that input. Empty Rust files are valid
+    /// and produce no findings.
     /// Findings and baseline entries use workspace-relative paths. Config is
     /// discovered from the source directory up to the workspace root (or
     /// from the current directory for stdin). Files that cannot be read or
@@ -146,8 +150,8 @@ impl Finding {
 /// The supported scan roots are documented on `AuditArgs::path`: a
 /// directory is walked recursively for `.rs` files, a single `.rs` file is
 /// scanned directly, and `-` reads Rust source from stdin. Directory walks
-/// prune `target/`, `node_modules/`, and every hidden directory (a name
-/// beginning with `.`, such as `.git/` or `.github/`) via
+/// prune `target/`, `vendor/`, `node_modules/`, and every hidden directory
+/// (a name beginning with `.`, such as `.git/` or `.github/`) via
 /// `collect_rust_sources`, so build output and vendored/tooling trees are
 /// never audited. A non-existent root returns an actionable error naming the
 /// supported inputs instead of silently reporting "no findings".
@@ -249,7 +253,7 @@ pub fn run(args: AuditArgs) -> Result<(), CliError> {
 /// These are build output and dependency/tooling trees that either generated
 /// non-contract Rust or would just slow the scan down; the audit is meant to
 /// run on hand-written contract source.
-pub const AUDIT_EXCLUDED_DIRS: &[&str] = &["target", "node_modules"];
+pub const AUDIT_EXCLUDED_DIRS: &[&str] = &["target", "vendor", "node_modules"];
 
 /// Prunes excluded directories during a walk. Returns `true` for the user's
 /// chosen root (even if it happens to share a name with an excluded
@@ -765,6 +769,8 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         let fn_name = node.sig.ident.to_string();
         let body_src = node.to_token_stream().to_string();
         self.audit_function(&node.sig, &node.block, body_src.clone(), line);
+        let body_src = normalized_tokens(node.to_token_stream()).to_string();
+        self.audit_function(&node.sig, body_src.clone(), line);
         self.audit_i128_arithmetic(&node.sig, &node.block, line);
         self.audit_ignored_transfer_results(&node.sig, &node.block);
         self.audit_mock_all_auths(&node.block, line, &fn_name);
@@ -777,11 +783,31 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
         let fn_name = node.sig.ident.to_string();
         let body_src = node.to_token_stream().to_string();
         self.audit_function(&node.sig, &node.block, body_src.clone(), line);
+        let body_src = normalized_tokens(node.to_token_stream()).to_string();
+        self.audit_function(&node.sig, body_src.clone(), line);
         self.audit_i128_arithmetic(&node.sig, &node.block, line);
         self.audit_ignored_transfer_results(&node.sig, &node.block);
         self.audit_mock_all_auths(&node.block, line, &fn_name);
         visit::visit_impl_item_fn(self, node);
     }
+}
+
+// Raw spelling does not change an identifier's meaning. Normalize identifiers
+// for the token-based heuristics without altering literals or source spans.
+fn normalized_tokens(tokens: TokenStream) -> TokenStream {
+    tokens
+        .into_iter()
+        .map(|token| match token {
+            TokenTree::Ident(ident) => TokenTree::Ident(ident.unraw()),
+            TokenTree::Group(group) => {
+                let mut normalized =
+                    Group::new(group.delimiter(), normalized_tokens(group.stream()));
+                normalized.set_span(group.span());
+                TokenTree::Group(normalized)
+            }
+            other => other,
+        })
+        .collect()
 }
 
 impl FunctionVisitor<'_> {
@@ -955,7 +981,7 @@ impl FunctionVisitor<'_> {
             if let FnArg::Typed(pat_type) = arg {
                 if type_is_i128(&pat_type.ty) {
                     if let Pat::Ident(ident) = &*pat_type.pat {
-                        i128_bindings.insert(ident.ident.to_string());
+                        i128_bindings.insert(ident.ident.unraw().to_string());
                     }
                 }
             }
@@ -999,7 +1025,7 @@ fn signed_amount_params(sig: &Signature) -> Vec<String> {
             FnArg::Typed(pat_type) if type_is_signed_integer(&pat_type.ty) => {
                 match &*pat_type.pat {
                     Pat::Ident(ident) if ident.ident.to_string().contains("amount") => {
-                        Some(ident.ident.to_string())
+                        Some(ident.ident.unraw().to_string())
                     }
                     _ => None,
                 }
@@ -1014,7 +1040,7 @@ fn type_is_signed_integer(ty: &Type) -> bool {
         Type::Reference(reference) => type_is_signed_integer(&reference.elem),
         Type::Path(path) => path.path.get_ident().is_some_and(|ident| {
             matches!(
-                ident.to_string().as_str(),
+                ident.unraw().to_string().as_str(),
                 "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
             )
         }),
@@ -1059,7 +1085,7 @@ fn type_is_address(ty: &Type) -> bool {
             .path
             .segments
             .last()
-            .is_some_and(|seg| seg.ident == "Address"),
+            .is_some_and(|seg| seg.ident.unraw() == "Address"),
         _ => false,
     }
 }
@@ -1161,11 +1187,11 @@ fn transfer_method_name(expr: &Expr) -> Option<&'static str> {
     match expr {
         Expr::MethodCall(call)
             if matches!(
-                call.method.to_string().as_str(),
+                call.method.unraw().to_string().as_str(),
                 "transfer" | "transfer_from" | "try_transfer" | "try_transfer_from"
             ) =>
         {
-            Some(match call.method.to_string().as_str() {
+            Some(match call.method.unraw().to_string().as_str() {
                 "transfer_from" => "transfer_from",
                 "try_transfer" => "try_transfer",
                 "try_transfer_from" => "try_transfer_from",
@@ -1206,7 +1232,7 @@ impl<'ast> Visit<'ast> for I128ArithmeticVisitor<'_> {
         if let Pat::Type(pat_type) = &node.pat {
             if type_is_i128(&pat_type.ty) {
                 if let Pat::Ident(ident) = &*pat_type.pat {
-                    self.i128_bindings.insert(ident.ident.to_string());
+                    self.i128_bindings.insert(ident.ident.unraw().to_string());
                 }
             }
         }
@@ -1257,7 +1283,7 @@ impl I128ArithmeticVisitor<'_> {
             Expr::Path(p) => p
                 .path
                 .get_ident()
-                .is_some_and(|ident| self.i128_bindings.contains(&ident.to_string())),
+                .is_some_and(|ident| self.i128_bindings.contains(&ident.unraw().to_string())),
             Expr::Lit(lit) => matches!(&lit.lit, syn::Lit::Int(i) if i.suffix() == "i128"),
             Expr::Paren(p) => self.touches_i128(&p.expr),
             Expr::Group(g) => self.touches_i128(&g.expr),
@@ -1267,7 +1293,7 @@ impl I128ArithmeticVisitor<'_> {
 }
 
 fn type_is_i128(ty: &Type) -> bool {
-    matches!(ty, Type::Path(p) if p.path.is_ident("i128"))
+    matches!(ty, Type::Path(p) if p.path.get_ident().is_some_and(|ident| ident.unraw() == "i128"))
 }
 
 #[cfg(test)]

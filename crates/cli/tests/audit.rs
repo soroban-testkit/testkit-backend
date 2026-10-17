@@ -1,8 +1,9 @@
 //! Integration tests for `soroban-testkit audit`.
 //!
 //! Exercises the CLI binary's documented scan roots (directory, single file,
-//! and stdin) and its directory exclusions (`target/`, `node_modules/`, and
-//! hidden directories), plus the actionable error for a missing path.
+//! and stdin) and its directory exclusions (`target/`, `vendor/`,
+//! `node_modules/`, and hidden directories), plus the actionable error for
+//! a missing path.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -94,6 +95,7 @@ fn audit_help_documents_supported_scan_roots_and_exclusions() {
     assert!(stdout.contains("directory"), "{stdout}");
     // Documented exclusions.
     assert!(stdout.contains("target/"), "{stdout}");
+    assert!(stdout.contains("vendor/"), "{stdout}");
     assert!(stdout.contains("node_modules/"), "{stdout}");
     assert!(stdout.contains("hidden"), "{stdout}");
     // Standard options remain documented.
@@ -124,6 +126,9 @@ fn audit_skips_excluded_directories() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::create_dir_all(root.join("target/debug")).unwrap();
+    std::fs::create_dir_all(root.join("vendor/dep/src")).unwrap();
+    std::fs::create_dir_all(root.join("src/nested/target/debug")).unwrap();
+    std::fs::create_dir_all(root.join("src/nested/vendor/dep")).unwrap();
     std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
     std::fs::create_dir_all(root.join(".git/objects")).unwrap();
     std::fs::write(root.join("src/vault.rs"), UNAUTHORIZED_ENTRY_POINT).unwrap();
@@ -138,6 +143,14 @@ fn audit_skips_excluded_directories() {
     )
     .unwrap();
     std::fs::write(root.join(".git/objects/blob.rs"), UNAUTHORIZED_ENTRY_POINT).unwrap();
+    for path in [
+        "vendor/dep/src/vendored.rs",
+        "src/nested/target/debug/generated_nested.rs",
+        "src/nested/vendor/dep/vendored_nested.rs",
+    ] {
+        // Prune the whole tree: even invalid Rust must not cause a scan error.
+        std::fs::write(root.join(path), "fn invalid(").unwrap();
+    }
 
     let output = run(&["audit", root.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -147,8 +160,176 @@ fn audit_skips_excluded_directories() {
     assert!(!stdout.contains("generated.rs"), "{stdout}");
     assert!(!stdout.contains("dep.rs"), "{stdout}");
     assert!(!stdout.contains("blob.rs"), "{stdout}");
+    assert!(!stdout.contains("vendored"), "{stdout}");
+    assert!(output.stderr.is_empty(), "{output:?}");
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn audit_scans_explicitly_selected_excluded_roots_and_similarly_named_directories() {
+    let fixture = AuditFixture::new("explicit-exclusions");
+    for directory in ["target", "vendor", "vendors", "target_contract"] {
+        std::fs::create_dir_all(fixture.0.join(directory)).unwrap();
+        let file = fixture.write(&format!("{directory}/lib.rs"), UNAUTHORIZED_ENTRY_POINT);
+        for root in [file.parent().unwrap(), file.as_path()] {
+            let output = run_from(
+                &fixture.0,
+                &[
+                    "audit",
+                    root.to_str().unwrap(),
+                    "--format",
+                    "json",
+                    "--strict",
+                ],
+            );
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(!output.status.success(), "{output:?}");
+            assert_eq!(report["summary"]["finding_count"], 1, "{report}");
+            assert_eq!(report["findings"][0]["rule"], "missing-require-auth");
+        }
+    }
+
+    let output = fixture.scan(&[]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 2, "{report}");
+}
+
+#[test]
+fn audit_raw_identifiers_report_the_same_rules_as_ordinary_identifiers() {
+    let fixture = AuditFixture::new("raw-identifiers");
+    let ordinary = r#"
+        fn withdraw(env: Env, caller: &sdk::Address, amount: i128, client: Client) {
+            let balance: i128 = 10;
+            let _ = balance + 1;
+            let _ = amount + 1;
+            env.storage().persistent().get(&"balance");
+            client.try_transfer(&caller, &caller, &amount);
+        }
+    "#;
+    let raw = r#"
+        fn r#type(r#env: Env, r#caller: &sdk::r#Address, r#amount: r#i128, client: Client) {
+            let r#balance: r#i128 = 10;
+            let _ = balance + 1;
+            let _ = amount + 1;
+            env.r#storage().r#persistent().r#get(&"balance");
+            client.r#try_transfer(&caller, &caller, &amount);
+        }
+    "#;
+    let mut reports = Vec::new();
+    for source in [ordinary, raw] {
+        fixture.write("crates/vault/src/lib.rs", source);
+        let output = fixture.scan(&["--strict"]);
+        assert!(!output.status.success(), "{output:?}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let findings = report["findings"].as_array().unwrap();
+        let mut rules: Vec<_> = findings
+            .iter()
+            .map(|f| f["rule"].as_str().unwrap().to_owned())
+            .collect();
+        rules.sort();
+        reports.push(rules);
+        for finding in findings {
+            assert!(finding["line"].as_u64().unwrap() > 0, "{finding}");
+            if source == raw {
+                assert!(
+                    finding["message"].as_str().unwrap().contains("fn r#type"),
+                    "{finding}"
+                );
+            }
+        }
+    }
+    assert_eq!(reports[0].len(), 6, "{reports:?}");
+    assert_eq!(reports[0], reports[1]);
+}
+
+#[test]
+fn audit_raw_identifiers_preserve_checked_operations() {
+    let fixture = AuditFixture::new("raw-identifiers-checked");
+    fixture.write(
+        "crates/vault/src/lib.rs",
+        r#"
+        impl Contract {
+            fn r#type(env: Env, caller: &r#Address, r#amount: r#i128, client: Client) {
+                caller.r#require_auth();
+                assert!(amount > 0);
+                let balance: i128 = 10;
+                let _ = r#balance.r#checked_add(r#amount);
+                env.r#storage().r#persistent().r#get(&"balance");
+                env.r#storage().r#persistent().r#extend_ttl(&"balance", 1, 2);
+                let _result = client.r#try_transfer(&caller, &caller, &amount);
+            }
+        }
+    "#,
+    );
+    let output = fixture.scan(&["--strict"]);
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 0, "{report}");
+}
+
+#[test]
+fn audit_accepts_empty_files_and_stdin_in_every_format() {
+    let fixture = AuditFixture::new("empty-source");
+    for source in ["", " \n\t\r\n", "// no items\n/* still empty */\n"] {
+        let file = fixture.write("crates/vault/src/lib.rs", source);
+        for format in ["text", "json", "sarif"] {
+            let outputs = [
+                fixture.scan(&["--format", format, "--strict"]),
+                run_from(
+                    &fixture.0,
+                    &[
+                        "audit",
+                        file.to_str().unwrap(),
+                        "--format",
+                        format,
+                        "--strict",
+                    ],
+                ),
+                run_with_stdin(
+                    &["audit", "-", "--format", format, "--strict"],
+                    source.as_bytes(),
+                ),
+            ];
+            for output in outputs {
+                assert!(output.status.success(), "{format}: {output:?}");
+                assert!(output.stderr.is_empty(), "{format}: {output:?}");
+                match format {
+                    "text" => assert!(
+                        String::from_utf8_lossy(&output.stdout).contains("audit: no findings")
+                    ),
+                    "json" => {
+                        let report: serde_json::Value =
+                            serde_json::from_slice(&output.stdout).unwrap();
+                        assert_eq!(report["summary"]["finding_count"], 0);
+                    }
+                    "sarif" => {
+                        let report: serde_json::Value =
+                            serde_json::from_slice(&output.stdout).unwrap();
+                        assert_eq!(report["runs"][0]["results"].as_array().unwrap().len(), 0);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn audit_empty_file_does_not_hide_findings_in_other_files() {
+    let fixture = AuditFixture::new("empty-with-findings");
+    fixture.write("crates/vault/src/empty.rs", "");
+    fixture.write("crates/vault/src/lib.rs", UNAUTHORIZED_ENTRY_POINT);
+    let output = fixture.scan(&["--strict"]);
+    assert!(!output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["summary"]["finding_count"], 1, "{report}");
+    assert_eq!(report["findings"][0]["rule"], "missing-require-auth");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("audit incomplete"),
+        "{output:?}"
+    );
 }
 
 #[test]

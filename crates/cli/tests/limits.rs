@@ -154,6 +154,107 @@ fn limits_rejects_unknown_function_with_available_list() {
 }
 
 #[test]
+fn limits_rejects_unknown_ramp_before_probing_or_writing_reports() {
+    let wasm = ensure_vault_wasm();
+    let root = std::env::temp_dir().join(format!("stk-limits-unknown-ramp-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let export = root.join("report.json");
+    let baseline = root.join("baseline.txt");
+    std::fs::write(&export, "existing export").unwrap();
+    std::fs::write(&baseline, "existing baseline").unwrap();
+
+    // `owner` exists on initialize, but not on the selected function.
+    for ramp in ["recipents", "Recipients", "owner", ""] {
+        let output = run(&[
+            "limits",
+            "--contract",
+            wasm.to_str().unwrap(),
+            "--fn",
+            "batch_payout",
+            "--ramp",
+            ramp,
+            "--probe-timeout",
+            "0",
+            "--arg",
+            "unknown=1",
+            "--export",
+            export.to_str().unwrap(),
+            "--save-baseline",
+            baseline.to_str().unwrap(),
+        ]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            stderr.contains(&format!("\"batch_payout\" has no parameter named {ramp:?}")),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("available parameters: recipients, amount"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("--ramp"), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert_eq!(std::fs::read_to_string(&export).unwrap(), "existing export");
+        assert_eq!(
+            std::fs::read_to_string(&baseline).unwrap(),
+            "existing baseline"
+        );
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn limits_explains_when_the_selected_function_has_no_rampable_parameters() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "balance",
+        "--ramp",
+        "env",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        stderr.contains("\"balance\" has no parameter named \"env\""),
+        "{stderr}"
+    );
+    assert!(stderr.contains("available parameters: (none)"), "{stderr}");
+    assert!(
+        stderr.contains("choose a function with a numeric, Bytes, or Vec parameter"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty(), "{output:?}");
+}
+
+#[test]
+fn limits_accepts_a_non_first_parameter_name_from_the_selected_abi() {
+    let wasm = ensure_vault_wasm();
+    let output = run(&[
+        "limits",
+        "--contract",
+        wasm.to_str().unwrap(),
+        "--fn",
+        "batch_payout",
+        "--ramp",
+        "amount",
+        "--arg",
+        "amount=10",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{output:?}");
+    // Reaching override validation proves the ABI lookup accepted `amount`.
+    assert!(
+        stderr.contains("--arg cannot override ramp parameter \"amount\""),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no parameter named"), "{stderr}");
+}
+
+#[test]
 fn limits_reports_refinement_audit_and_limitations_in_stdout() {
     let wasm = ensure_vault_wasm();
     let output = run(&[
