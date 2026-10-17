@@ -619,3 +619,136 @@ fn audit_stdin_discovers_config_from_the_current_workspace() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["summary"]["finding_count"], 0);
 }
+
+#[test]
+fn audit_strict_mode_exits_zero_when_findings_are_suppressed() {
+    let root = std::env::temp_dir().join(format!(
+        "stk-audit-strict-suppressed-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"
+        #[contractimpl]
+        impl Contract {
+            // soroban_testkit::audit(skip, rule = "missing-require-auth")
+            pub fn withdraw(env: Env, from: Address) {
+                env.storage().instance().set(&from, &1i128);
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let output = run(&["audit", root.to_str().unwrap(), "--strict"]);
+    assert!(
+        output.status.success(),
+        "strict exit status should be 0 when findings are suppressed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("audit: no findings"), "{stdout}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn audit_recognizes_qualified_require_auth_calls() {
+    let root = std::env::temp_dir().join(format!("stk-audit-qual-auth-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"
+        #[contractimpl]
+        impl Contract {
+            pub fn withdraw(env: Env, from: Address) {
+                Address::require_auth(&from);
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let output = run(&["audit", root.to_str().unwrap()]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("missing-require-auth"), "{stdout}");
+    assert!(stdout.contains("audit: no findings"), "{stdout}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn audit_negated_auth_branch_is_not_treated_as_enforced_in_cli() {
+    let root = std::env::temp_dir().join(format!("stk-audit-negated-auth-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        r#"
+        #[contractimpl]
+        impl Contract {
+            pub fn withdraw(env: Env, from: Address) {
+                if !is_admin {
+                    from.require_auth();
+                }
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    let output = run(&["audit", root.to_str().unwrap(), "--strict"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("audit finding(s)"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("missing-require-auth"), "{stdout}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn audit_runs_are_byte_for_byte_deterministic_across_repeated_invocations() {
+    let root = std::env::temp_dir().join(format!("stk-audit-deterministic-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/z_file.rs"),
+        r#"
+        #[contractimpl]
+        impl ContractZ {
+            pub fn withdraw(env: Env, from: Address) {}
+        }
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/a_file.rs"),
+        r#"
+        #[contractimpl]
+        impl ContractA {
+            pub fn deposit(amount: i128) -> i128 {
+                amount + 10
+            }
+        }
+        "#,
+    )
+    .unwrap();
+
+    for format in ["text", "json", "sarif"] {
+        let run1 = run(&["audit", root.to_str().unwrap(), "--format", format]);
+        let run2 = run(&["audit", root.to_str().unwrap(), "--format", format]);
+        assert!(run1.status.success());
+        assert!(run2.status.success());
+        assert_eq!(
+            run1.stdout, run2.stdout,
+            "repeated audit run with format '{format}' must be byte-for-byte identical"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
