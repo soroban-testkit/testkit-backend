@@ -687,6 +687,7 @@ fn audit_source(
         findings,
         config,
         suppressions: &suppressions,
+        source: full_src,
         current_column: 1,
     };
     visitor.visit_file(&file);
@@ -753,12 +754,13 @@ struct FunctionVisitor<'a> {
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
+    source: &'a str,
     current_column: usize,
 }
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
-        let (line, column) = position_of(node);
+        let (line, column) = position_of(node, self.source);
         self.current_column = column;
         let fn_name = node.sig.ident.to_string();
         let body_src = node.to_token_stream().to_string();
@@ -770,7 +772,7 @@ impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
-        let (line, column) = position_of(node);
+        let (line, column) = position_of(node, self.source);
         self.current_column = column;
         let fn_name = node.sig.ident.to_string();
         let body_src = node.to_token_stream().to_string();
@@ -968,6 +970,7 @@ impl FunctionVisitor<'_> {
             findings: self.findings,
             config: self.config,
             suppressions: self.suppressions,
+            source: self.source,
         };
         visitor.visit_block(body);
     }
@@ -983,6 +986,7 @@ impl FunctionVisitor<'_> {
             findings: self.findings,
             config: self.config,
             suppressions: self.suppressions,
+            source: self.source,
         };
         visitor.visit_block(body);
     }
@@ -1060,13 +1064,13 @@ fn type_is_address(ty: &Type) -> bool {
     }
 }
 
-fn position_of(node: impl quote::ToTokens) -> (usize, usize) {
+fn position_of(node: impl quote::ToTokens, source: &str) -> (usize, usize) {
     node.to_token_stream()
         .into_iter()
         .next()
         .map(|token| {
             let start = token.span().start();
-            (start.line, start.column + 1)
+            (start.line, source.lines().nth(start.line.saturating_sub(1)).map(|line| line[..start.column.min(line.len())].chars().count() + 1).unwrap_or(1))
         })
         .unwrap_or((0, 1))
 }
@@ -1119,7 +1123,7 @@ impl<'ast> Visit<'ast> for IgnoredTransferVisitor<'_> {
         };
 
         if let Some(expr) = ignored_call {
-            let (line, column) = position_of(expr);
+            let (line, column) = position_of(expr, self.source);
             let is_suppressed = self.suppressions.iter().any(|s| {
                 (s.line == line || s.line == line - 1)
                     && (s.rules.contains(&"*".to_string())
@@ -1379,6 +1383,8 @@ mod tests {
             findings: &mut findings,
             config: &config,
             suppressions: &suppressions,
+            source: code,
+            current_column: 1,
         };
         visitor.visit_file(&file);
 
@@ -1407,6 +1413,8 @@ mod tests {
             findings: &mut findings,
             config: &config,
             suppressions: &suppressions,
+            source: code,
+            current_column: 1,
         };
         visitor.visit_file(&file);
 
@@ -1446,6 +1454,8 @@ mod tests {
             findings: &mut findings,
             config: &config,
             suppressions: &suppressions,
+            source: code,
+            current_column: 1,
         };
         visitor.visit_file(&file);
 
@@ -1485,6 +1495,8 @@ mod tests {
             findings: &mut findings,
             config: &config,
             suppressions: &suppressions,
+            source: code,
+            current_column: 1,
         };
         visitor.visit_file(&file);
 
@@ -1514,6 +1526,8 @@ mod tests {
             findings: &mut findings,
             config: &config,
             suppressions: &suppressions,
+            source: code,
+            current_column: 1,
         };
         visitor.visit_file(&file);
 
