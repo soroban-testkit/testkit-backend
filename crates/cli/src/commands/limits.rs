@@ -44,6 +44,8 @@ pub enum ProbeFailureCategory {
     /// either rejected the ramp value with its own validation error or
     /// exhausted a host resource budget.
     ExitFailure,
+    /// A contract rejected or trapped before exhausting a resource budget.
+    ContractFailure,
     /// The probe exceeded `--probe-timeout` and was killed by the parent
     /// before it could finish.
     TimedOut,
@@ -62,6 +64,7 @@ impl ProbeFailureCategory {
     pub fn label(self) -> &'static str {
         match self {
             ProbeFailureCategory::ExitFailure => "exit-failure",
+            ProbeFailureCategory::ContractFailure => "contract-failure",
             ProbeFailureCategory::TimedOut => "timed-out",
             ProbeFailureCategory::Abort => "abort",
             ProbeFailureCategory::SpawnFailure => "spawn-failure",
@@ -73,7 +76,10 @@ impl ProbeFailureCategory {
     pub fn guidance(self) -> &'static str {
         match self {
             ProbeFailureCategory::ExitFailure => {
-                "the contract rejected this value or exhausted a resource budget; this is the normal ceiling signal"
+                "the probe exited non-zero; check its stderr to distinguish rejection from exhaustion"
+            }
+            ProbeFailureCategory::ContractFailure => {
+                "the contract rejected or trapped at this value before any verified resource ceiling; inspect the contract logic"
             }
             ProbeFailureCategory::TimedOut => {
                 "raise --probe-timeout to confirm whether the ceiling reflects a hang or a real resource limit"
@@ -107,6 +113,19 @@ impl ProbeOutcome {
     /// Whether the probe succeeded, for the binary search's yes/no decision.
     pub fn succeeded(self) -> bool {
         matches!(self, ProbeOutcome::Succeeded)
+    }
+}
+
+/// Probe child errors have a stable marker only when the SDK reported a
+/// non-budget invocation error. Generic non-zero exits remain ambiguous.
+fn classify_probe_exit_stderr(stderr: &str) -> ProbeFailureCategory {
+    if stderr
+        .lines()
+        .any(|line| line.starts_with("error: contract-failure:"))
+    {
+        ProbeFailureCategory::ContractFailure
+    } else {
+        ProbeFailureCategory::ExitFailure
     }
 }
 
@@ -206,6 +225,15 @@ impl LimitsSummary {
         out.push_str(&format!("  ({})\n", self.measurement_limitations));
         if let Some(repro) = &self.reproduction {
             out.push_str(&format!("  reproduce locally: {repro}\n"));
+        }
+        if self
+            .probe_failure_counts
+            .contains_key(&ProbeFailureCategory::Abort)
+        {
+            out.push_str(
+                "  note: a host abort may reflect a contract trap rather than a resource limit; \
+                 inspect the function and re-run to confirm\n",
+            );
         }
         if self.hit_upper_bound {
             out.push_str(&format!(
@@ -431,41 +459,46 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
                     ProbeFailureCategory::SpawnFailure.guidance()
                 ))
             })?;
-        // Own every probe so early returns or errors cannot leave it running.
+        // Retain upstream's RAII cleanup on early returns and failures.
         let mut child = ProbeChild { child };
 
-        let outcome = match wait_with_timeout(&mut child.child, probe_timeout)? {
+        let status = wait_with_timeout(&mut child.child, probe_timeout)?;
+        let stderr = child
+            .child
+            .stderr
+            .take()
+            .map_or(Ok(String::new()), |mut stream| {
+                use std::io::Read;
+                let mut buffer = String::new();
+                stream.read_to_string(&mut buffer).map(|_| buffer)
+            })
+            .map_err(|err| CliError(format!("failed to read probe stderr: {err}")))?;
+
+        let outcome = match status {
             Some(status) if status.success() => ProbeOutcome::Succeeded,
-            // A signal-terminated child has no exit code; that is the host
-            // abort this command exists to survive, not a normal rejection.
             Some(status) if status.code().is_none() => {
                 ProbeOutcome::Failed(ProbeFailureCategory::Abort)
             }
-            Some(_) => ProbeOutcome::Failed(ProbeFailureCategory::ExitFailure),
+            Some(_) => ProbeOutcome::Failed(classify_probe_exit_stderr(&stderr)),
             None => ProbeOutcome::Failed(ProbeFailureCategory::TimedOut),
         };
+
         if let ProbeOutcome::Failed(category) = outcome {
+            // A contract failure cannot establish a budget ceiling, even if
+            // earlier, lower ramp values succeeded.
+            if category == ProbeFailureCategory::ContractFailure {
+                return Err(CliError(format!(
+                    "contract function {:?} failed at {}={} before a resource limit was verified; \
+                     check the contract's validation and trap logic; probe stderr: {}",
+                    args.function,
+                    args.ramp,
+                    value,
+                    stderr.trim()
+                )));
+            }
             *probe_failure_counts.entry(category).or_insert(0) += 1;
-            // Capture the child's stderr the first time a probe fails, so the
-            // report carries actionable context about *why* the ceiling was
-            // hit rather than silently discarding it. Only the first failure
-            // is retained: later failures in the same run typically have the
-            // same root cause, and keeping one keeps the report concise.
-            if first_failed_probe_stderr.is_none() {
-                if let Ok(stderr) = child
-                    .child
-                    .stderr
-                    .take()
-                    .map_or(Ok(String::new()), |mut s| {
-                        use std::io::Read;
-                        let mut buf = String::new();
-                        s.read_to_string(&mut buf).map(|_| buf)
-                    })
-                {
-                    if !stderr.trim().is_empty() {
-                        first_failed_probe_stderr = Some(stderr);
-                    }
-                }
+            if first_failed_probe_stderr.is_none() && !stderr.trim().is_empty() {
+                first_failed_probe_stderr = Some(stderr);
             }
         }
         Ok(outcome)
@@ -748,10 +781,12 @@ pub fn run_probe(args: ProbeArgs) -> Result<(), CliError> {
         load(&args.contract, &args.function, &args.ramp)?;
     let args_vec = build_args(&env, &function, ramp_index, args.value, &args.arg_values)?;
     let func = Symbol::new(&env, &args.function);
-    if invoke_succeeds(&env, &contract_id, &func, args_vec) {
-        Ok(())
-    } else {
-        Err(CliError("probe failed".to_string()))
+    match env.try_invoke_contract::<Val, soroban_sdk::Error>(&contract_id, &func, args_vec) {
+        Ok(Ok(_)) => Ok(()),
+        Err(Ok(err)) if !err.is_type(soroban_sdk::xdr::ScErrorType::Budget) => Err(CliError(
+            format!("contract-failure: invocation returned {err:?}"),
+        )),
+        _ => Err(CliError("probe failed".to_string())),
     }
 }
 
@@ -2095,6 +2130,29 @@ mod tests {
                 (!step.succeeded).then_some(ProbeFailureCategory::ExitFailure)
             );
         }
+    }
+
+    // ---- #444: contract failures must not be treated as budget ceilings ----
+    #[test]
+    fn probe_exit_classifier_distinguishes_contract_errors_from_unknown_exits() {
+        assert_eq!(
+            classify_probe_exit_stderr(
+                "error: contract-failure: invocation returned Error(Contract, #1)\n"
+            ),
+            ProbeFailureCategory::ContractFailure
+        );
+        assert_eq!(
+            classify_probe_exit_stderr("error: probe failed\n"),
+            ProbeFailureCategory::ExitFailure
+        );
+        assert_eq!(
+            classify_probe_exit_stderr(""),
+            ProbeFailureCategory::ExitFailure
+        );
+        assert_eq!(
+            serde_json::to_value(ProbeFailureCategory::ContractFailure).unwrap(),
+            serde_json::json!("contract-failure")
+        );
     }
 
     // ---- #492: standardized probe failure categories ----

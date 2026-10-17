@@ -619,3 +619,125 @@ fn audit_stdin_discovers_config_from_the_current_workspace() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["summary"]["finding_count"], 0);
 }
+
+// #436: Unix paths may contain non-UTF-8 bytes; text output must be legible.
+#[cfg(unix)]
+#[test]
+fn audit_text_escapes_invalid_utf8_path_without_loss() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = std::env::temp_dir().join(format!("stk-audit-invalid-path-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let filename = std::ffi::OsString::from_vec(b"invalid-\xff.rs".to_vec());
+    let path = root.join(filename);
+    std::fs::write(&path, UNAUTHORIZED_ENTRY_POINT).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_soroban-testkit"))
+        .arg("audit")
+        .arg(&path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "{stdout}");
+    assert!(
+        stdout.to_ascii_lowercase().contains(r"\xff"),
+        "expected escaped original byte: {stdout}"
+    );
+    assert!(!stdout.contains('\u{fffd}'), "path was lossy: {stdout}");
+    assert!(stdout.contains("missing-require-auth"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// #438: show file, table/key and line for a wrongly-typed rule option.
+#[test]
+fn audit_config_error_names_path_and_setting() {
+    let root = std::env::temp_dir().join(format!("stk-audit-bad-config-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("src.rs"), UNAUTHORIZED_ENTRY_POINT).unwrap();
+    std::fs::write(
+        root.join(".soroban-testkit.toml"),
+        "[rules.missing-require-auth]\nenabled = 'definitely'\n",
+    )
+    .unwrap();
+    let output = run(&["audit", root.to_str().unwrap()]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(".soroban-testkit.toml"), "{stderr}");
+    assert!(stderr.contains("enabled"), "{stderr}");
+    assert!(stderr.contains("line 2"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// #432: helper methods compiled only in tests must not raise production warnings.
+#[test]
+fn audit_skips_test_only_helpers_but_checks_production_methods() {
+    let source = r#"
+struct Vault;
+impl Vault {
+    pub fn live(&self, from: Address) { let _ = from; }
+}
+#[cfg(test)]
+mod tests {
+    pub fn helper(from: Address) { let _ = from; }
+    struct Helpers;
+    impl Helpers { pub fn internal(&self, from: Address) { let _ = from; } }
+}
+#[cfg(test)]
+pub fn another_helper(from: Address) { let _ = from; }
+#[cfg(not(test))]
+pub fn production_only(from: Address) { let _ = from; }
+#[cfg(any(test, feature = "logging"))]
+pub fn also_production(from: Address) { let _ = from; }
+#[cfg(all(test, feature = "logging"))]
+pub fn helper_with_feature(from: Address) { let _ = from; }
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], source.as_bytes());
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert!(findings
+        .iter()
+        .any(|finding| finding["message"].as_str().unwrap().contains("live")));
+    assert!(findings.iter().any(|finding| finding["message"]
+        .as_str()
+        .unwrap()
+        .contains("production_only")));
+    assert!(findings.iter().any(|finding| finding["message"]
+        .as_str()
+        .unwrap()
+        .contains("also_production")));
+    assert!(!findings.iter().any(|finding| {
+        let msg = finding["message"].as_str().unwrap();
+        msg.contains("helper") || msg.contains("internal")
+    }));
+}
+
+#[test]
+fn audit_does_not_treat_integration_test_files_as_production() {
+    let root = std::env::temp_dir().join(format!("stk-audit-test-tree-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("tests/helpers.rs"),
+        "fn helper(from: Address) { let _ = from; }",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "fn live(from: Address) { let _ = from; }",
+    )
+    .unwrap();
+    let output = run(&["audit", root.to_str().unwrap(), "--format", "json"]);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert!(findings
+        .iter()
+        .any(|finding| finding["file"].as_str().unwrap().ends_with("src/lib.rs")));
+    assert!(!findings.iter().any(|finding| finding["file"]
+        .as_str()
+        .unwrap()
+        .ends_with("tests/helpers.rs")));
+    let _ = std::fs::remove_dir_all(&root);
+}

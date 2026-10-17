@@ -442,6 +442,14 @@ pub struct DiagnosticRenderer<'a> {
     findings: &'a [Finding],
 }
 
+/// Present non-UTF-8 names unambiguously rather than replacing bytes with U+FFFD.
+/// The standard Path::display() uses a lossy conversion for such names.
+fn display_audit_path(path: &Path) -> String {
+    path.to_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{path:?}"))
+}
+
 impl<'a> DiagnosticRenderer<'a> {
     /// Create a new diagnostic renderer for the given findings.
     pub fn new(findings: &'a [Finding]) -> Self {
@@ -467,7 +475,7 @@ impl<'a> DiagnosticRenderer<'a> {
         for finding in self.findings {
             output.push_str(&format!(
                 "{}:{}: [{}] {}: {}\n",
-                finding.file.display(),
+                display_audit_path(&finding.file),
                 finding.line,
                 finding.severity,
                 finding.rule,
@@ -606,6 +614,44 @@ fn workspace_relative_path(path: &Path, workspace: &Path) -> PathBuf {
         .collect()
 }
 
+/// Extract the source line and TOML table/key from a deserialization error.
+/// If the parser cannot identify a key (e.g. an unterminated table), the
+/// source line is still helpful alongside the path and parser diagnostic.
+fn config_error_context(content: &str, err: &toml::de::Error) -> String {
+    let Some(span) = err.span() else {
+        return String::new();
+    };
+    let position = span.start.min(content.len());
+    let line_index = content
+        .get(..position)
+        .unwrap_or("")
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    let line = content.lines().nth(line_index).unwrap_or("");
+    let key = line
+        .split_once('=')
+        .map(|(key, _)| key.trim())
+        .filter(|key| !key.is_empty());
+    let section = content
+        .lines()
+        .take(line_index + 1)
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix('[')
+                .and_then(|section| section.strip_suffix(']'))
+        })
+        .last()
+        .unwrap_or("");
+    match key {
+        Some(key) if !section.is_empty() => {
+            format!(" at line {} (key `{section}.{key}`)", line_index + 1)
+        }
+        Some(key) => format!(" at line {} (key `{key}`)", line_index + 1),
+        None => format!(" at line {}", line_index + 1),
+    }
+}
+
 fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliError> {
     for dir in source_dir.ancestors() {
         for name in [".soroban-testkit.toml", "soroban-testkit.toml"] {
@@ -622,8 +668,9 @@ fn load_config(source_dir: &Path, workspace: &Path) -> Result<AuditConfig, CliEr
             };
             return toml::from_str(&content).map_err(|err| {
                 CliError(format!(
-                    "failed to parse audit config {} as TOML: {err}; fix the configuration syntax",
-                    path.display()
+                    "failed to parse audit config {}{} as TOML: {err}; fix the configuration syntax",
+                    path.display(),
+                    config_error_context(&content, &err)
                 ))
             });
         }
@@ -686,6 +733,9 @@ fn audit_source(
         findings,
         config,
         suppressions: &suppressions,
+        test_context: path
+            .components()
+            .any(|part| part.as_os_str() == "tests" || part.as_os_str() == "benches"),
     };
     visitor.visit_file(&file);
     Ok(())
@@ -733,34 +783,90 @@ fn extract_suppressions(src: &str) -> Vec<Suppression> {
     suppressions
 }
 
+/// True only for cfg predicates that *require* `test` to be enabled.
+/// `cfg(any(test, feature = "x"))` is not test-only: it can ship in production.
+fn cfg_requires_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") || list.path.is_ident("any") => {
+            let Ok(parts) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                parts.iter().any(cfg_requires_test)
+            } else {
+                !parts.is_empty() && parts.iter().all(cfg_requires_test)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("test")
+            || (attr.path().is_ident("cfg")
+                && attr
+                    .parse_args::<syn::Meta>()
+                    .is_ok_and(|meta| cfg_requires_test(&meta)))
+    })
+}
+
 struct FunctionVisitor<'a> {
     path: PathBuf,
     findings: &'a mut Vec<Finding>,
     config: &'a AuditConfig,
     suppressions: &'a [Suppression],
+    test_context: bool,
 }
 
 impl<'ast> Visit<'ast> for FunctionVisitor<'_> {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        let previous = self.test_context;
+        self.test_context |= is_test_only(&node.attrs);
+        visit::visit_item_mod(self, node);
+        self.test_context = previous;
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let previous = self.test_context;
+        self.test_context |= is_test_only(&node.attrs);
+        visit::visit_item_impl(self, node);
+        self.test_context = previous;
+    }
+
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
         let line = line_of(node);
         let fn_name = node.sig.ident.to_string();
         let body_src = node.to_token_stream().to_string();
-        self.audit_function(&node.sig, body_src.clone(), line);
-        self.audit_i128_arithmetic(&node.sig, &node.block, line);
-        self.audit_ignored_transfer_results(&node.sig, &node.block);
+        let previous = self.test_context;
+        self.test_context |= is_test_only(&node.attrs);
+        if !self.test_context {
+            self.audit_function(&node.sig, body_src.clone(), line);
+            self.audit_i128_arithmetic(&node.sig, &node.block, line);
+            self.audit_ignored_transfer_results(&node.sig, &node.block);
+        }
         self.audit_mock_all_auths(&body_src, line, &fn_name);
         visit::visit_item_fn(self, node);
+        self.test_context = previous;
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast ImplItemFn) {
         let line = line_of(node);
         let fn_name = node.sig.ident.to_string();
         let body_src = node.to_token_stream().to_string();
-        self.audit_function(&node.sig, body_src.clone(), line);
-        self.audit_i128_arithmetic(&node.sig, &node.block, line);
-        self.audit_ignored_transfer_results(&node.sig, &node.block);
+        let previous = self.test_context;
+        self.test_context |= is_test_only(&node.attrs);
+        if !self.test_context {
+            self.audit_function(&node.sig, body_src.clone(), line);
+            self.audit_i128_arithmetic(&node.sig, &node.block, line);
+            self.audit_ignored_transfer_results(&node.sig, &node.block);
+        }
         self.audit_mock_all_auths(&body_src, line, &fn_name);
         visit::visit_impl_item_fn(self, node);
+        self.test_context = previous;
     }
 }
 
@@ -1319,6 +1425,7 @@ mod tests {
             findings: &mut findings,
             config: &config,
             suppressions: &suppressions,
+            test_context: false,
         };
         visitor.visit_file(&file);
 
@@ -1347,6 +1454,7 @@ mod tests {
             findings: &mut findings,
             config: &config,
             suppressions: &suppressions,
+            test_context: false,
         };
         visitor.visit_file(&file);
 
@@ -1386,6 +1494,7 @@ mod tests {
             findings: &mut findings,
             config: &config,
             suppressions: &suppressions,
+            test_context: false,
         };
         visitor.visit_file(&file);
 
@@ -1425,6 +1534,7 @@ mod tests {
             findings: &mut findings,
             config: &config,
             suppressions: &suppressions,
+            test_context: false,
         };
         visitor.visit_file(&file);
 
@@ -1454,6 +1564,7 @@ mod tests {
             findings: &mut findings,
             config: &config,
             suppressions: &suppressions,
+            test_context: false,
         };
         visitor.visit_file(&file);
 

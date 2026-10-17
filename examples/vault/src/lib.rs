@@ -131,6 +131,16 @@ impl Vault {
         env.storage().temporary().get(&DataKey::Temp).unwrap_or(0)
     }
 
+    /// Regression fixture for the limits CLI: rejects a count above three
+    /// before resource budgets are exhausted.
+    pub fn reject_after_three(count: u32) -> Result<u32, VaultError> {
+        if count > 3 {
+            Err(VaultError::InsufficientBalance)
+        } else {
+            Ok(count)
+        }
+    }
+
     /// Pays `amount` to every address in `recipients`. Used by
     /// `soroban-testkit limits` to demonstrate ramping a batch operation's
     /// recipient count until it exceeds mainnet resource limits.
