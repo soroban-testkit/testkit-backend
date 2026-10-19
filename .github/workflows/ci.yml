@@ -68,6 +68,15 @@ jobs:
       # Avoid concurrent rustdoc writers racing in shared target/doc metadata.
       - run: cargo doc --workspace --no-deps -j 1
 
+  issue-templates:
+    name: issue template metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Parses every form in .github/ISSUE_TEMPLATE and fails with the file
+      # and field that is invalid. No Rust toolchain is needed.
+      - run: bash .github/scripts/check-issue-templates.sh
+
   audit:
     name: cargo audit
     runs-on: ubuntu-latest

@@ -200,6 +200,8 @@ canonical repository URL.
   on.
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — which `soroban-sdk` and Stellar
   protocol versions each release targets.
+- [`docs/api-migration.md`](docs/api-migration.md) — what to change in your
+  tests when moving to a new minor release.
 - [`RELEASING.md`](RELEASING.md) — the release checklist for
   `soroban-testkit` and `soroban-testkit-cli`.
 - [`BUILD_SPEC.md`](BUILD_SPEC.md) — the build plan and module boundaries.

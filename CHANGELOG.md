@@ -30,6 +30,9 @@ section, so a merge can never land without a place to record the change.
 
 ### Added
 
+- Prebuilt `soroban-testkit` CLI archives (with `.sha256` checksums) for
+  Linux x86_64, macOS x86_64 and arm64, and Windows x86_64, attached to each
+  GitHub release.
 - Core test environment: `TestEnv` with deterministic seeding
   (`with_seed`), random address generation, and a `TestkitError` type that
   every assertion helper panics with.

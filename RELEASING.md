@@ -39,7 +39,9 @@ publish if any of them fail.
    tree where tag, version, and changelog all agree.
 4. **API policy is honored.** If the bump is a breaking change (see
    `API_STABILITY.md` — for a `0.x` crate that means a minor bump), the
-   breaking changes are listed in the changelog.
+   breaking changes are listed in the changelog. Add a `## 0.<minor>`
+   section to [`docs/api-migration.md`](docs/api-migration.md) for the new
+   minor release, with the steps a downstream test suite needs.
 5. **Compatibility matrix is current.** [`COMPATIBILITY.md`](COMPATIBILITY.md)
    documents the `soroban-sdk` and Stellar protocol version this release
    targets and passes CI's docs check. If the pinned `soroban-sdk` moved,
@@ -57,7 +59,14 @@ publish if any of them fail.
 
 8. The `Release` workflow runs the checklist, then publishes both crates to
    crates.io in order (`soroban-testkit` first, then `soroban-testkit-cli`)
-   and creates a GitHub release from the changelog section.
+   and creates a GitHub release from the changelog section. It also builds
+   the `soroban-testkit` CLI for each supported target and attaches the
+   archives and their `.sha256` checksums to the release:
+   `x86_64-unknown-linux-gnu`, `x86_64-apple-darwin`,
+   `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`. A new target is added
+   to the matrix in [`release.yml`](.github/workflows/release.yml) and the
+   allowlist in [`build-cli-binaries.sh`](.github/scripts/build-cli-binaries.sh)
+   together.
 
 ### Post-release
 
