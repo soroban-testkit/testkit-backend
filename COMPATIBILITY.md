@@ -32,6 +32,46 @@ version (SDK `27.0.x` ↔ protocol 27). Protocol reference:
   with security fixes; a pinned major that is older is a risk worth
   recording in this matrix.
 
+## Pinning compatible versions
+
+Pick the row in the matrix above that matches the Stellar network you deploy
+to, then pin both crates in your own `Cargo.toml` so a `cargo update` cannot
+move one without the other:
+
+```toml
+[dev-dependencies]
+soroban-testkit = "=0.1.0"
+soroban-sdk = "=27.0.6"   # keep your existing features, e.g. "testutils"
+```
+
+The `=` exact pin matters because `soroban-testkit` is `0.x`: a minor bump
+may break your tests (see [`API_STABILITY.md`](API_STABILITY.md)). To upgrade,
+change both pins in the same commit and read the matching section of the
+[API migration guide](docs/api-migration.md) and the
+[SDK migration guide](docs/sdk-migration.md).
+
+To install the CLI at the same version, once it is published:
+
+```sh
+cargo install soroban-testkit-cli --version =0.1.0 --locked
+```
+
+### Checking the resolved versions
+
+Run `cargo tree -i soroban-sdk` in your project. It must list exactly one
+`soroban-sdk` version, and it must be the one in the matrix row you chose.
+
+If it lists two versions, another dependency pins a different `soroban-sdk`
+major. Cargo then builds two copies of the SDK, and types from one copy do not
+unify with the other. The symptom is a compile error such as
+`expected struct ..., found struct ...` that names the same type twice. Fix it
+by moving the other dependency to the same SDK major, or by pinning the
+`soroban-sdk` version the row lists so Cargo unifies them.
+
+Every release keeps the CLI's pinned `soroban-spec` equal to the workspace
+`soroban-sdk` version; the [`docs` workflow](.github/workflows/docs.yml)
+fails the PR if they differ.
+
 ## Historical rows
 
 A row per released version is kept here, oldest last, so users of an older

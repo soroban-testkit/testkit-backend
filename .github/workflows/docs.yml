@@ -43,6 +43,15 @@ jobs:
             echo "crates/cli/Cargo.toml pinned soroban-spec ($spec) does not match workspace soroban-sdk ($sdk); update both on SDK bump."; exit 1;
           fi
 
+      - name: API migration guide has a section for the current minor release
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          minor="${version%.*}"
+          test -f docs/api-migration.md \
+            || { echo "missing docs/api-migration.md; every minor release needs an API migration guide."; exit 1; }
+          grep -Fq "## $minor " docs/api-migration.md \
+            || { echo "docs/api-migration.md needs a \"## $minor\" section for the current minor release ($version)."; exit 1; }
+
       - name: README links the process docs
         run: |
           for f in CHANGELOG.md API_STABILITY.md COMPATIBILITY.md RELEASING.md; do
