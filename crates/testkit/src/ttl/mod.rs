@@ -55,8 +55,10 @@
 //! [`crate::core::TestEnv::expire`] avoids per-entry differences entirely by
 //! advancing one ledger past `max_entry_ttl`, which expires every kind at once.
 
+mod capabilities;
 mod expiry;
 
+pub use capabilities::SdkTtlCapabilities;
 pub use expiry::{
     ArchivalParameters, StorageKind, TtlSnapshot, TtlTimeline,
     ARCHIVAL_PROTOCOL_CONTRACT_LIFECYCLE, ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH,
