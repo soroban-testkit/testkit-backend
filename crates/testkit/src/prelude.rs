@@ -1,7 +1,7 @@
 //! Everything a test file typically needs, in one `use`:
 //! `use soroban_testkit::prelude::*;`.
 
-pub use crate::auth::AuthMatrix;
+pub use crate::auth::{AdminUserActors, AuthMatrix, OwnerActors, PeerActors, RbacActors};
 pub use crate::core::{Actor, AddressIter, TestEnv, TestFixture, TestkitError};
 pub use crate::events::{CapturedEvent, EventLog};
 pub use crate::ledger::LedgerCheckpoint;
