@@ -205,6 +205,8 @@ canonical repository URL.
 - [`BUILD_SPEC.md`](BUILD_SPEC.md) — the build plan and module boundaries.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — a contributor-facing map of the
   workspace.
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — what the common
+  `soroban-testkit` failure codes mean and how to fix them.
 
 ## Prior art
 

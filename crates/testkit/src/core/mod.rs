@@ -2,6 +2,30 @@
 //! around [`soroban_sdk::Env`], and [`TestkitError`], the error type
 //! assertion helpers panic with.
 //!
+//! # Thread Safety and Environment Sharing
+//!
+//! - **One environment per test.** [`TestEnv`] is neither `Send` nor `Sync`:
+//!   it holds the `soroban_sdk` host behind an `Rc`. It cannot be moved into
+//!   `std::thread::spawn`, and it cannot be shared by reference across
+//!   threads either. Build a fresh `TestEnv` inside each test (or each
+//!   thread that needs one).
+//! - **Parallel tests are isolated.** Cargo runs each `#[test]` on its own
+//!   thread with its own `TestEnv`. Ledger time, storage, captured events,
+//!   address labels, and checkpoints belong to one environment, so one test
+//!   cannot observe another test's `advance`, `warp_to`, or `at` calls.
+//! - **Cloning configuration is not sharing state.** [`TestEnv::clone_config`]
+//!   and [`TestEnv::reset`] start from the same configuration with a fresh
+//!   ledger. Neither hands the original host to another environment.
+//! - **Raw handles alias the same host.** A reference from
+//!   [`TestEnv::env`] points at the environment's own host, not a copy.
+//!   Mutations made through it are visible through the `TestEnv`, and
+//!   `env().clone()` produces a second handle to that same host.
+//! - **Seeds are unique, not reproducible.** [`TestEnv::new`] derives its
+//!   seed from the wall clock and a process-wide counter, so two environments
+//!   never share a seed within one process, but the seeds depend on creation
+//!   order. Use [`TestEnv::with_seed`] when a test must produce the same
+//!   values on every run.
+//!
 //! # `no_std` Compatibility Assessment
 //!
 //! **Current status: `std`-only.**
