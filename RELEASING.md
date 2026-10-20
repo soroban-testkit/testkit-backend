@@ -39,7 +39,10 @@ publish if any of them fail.
    tree where tag, version, and changelog all agree.
 4. **API policy is honored.** If the bump is a breaking change (see
    `API_STABILITY.md` — for a `0.x` crate that means a minor bump), the
-   breaking changes are listed in the changelog.
+   breaking changes are listed in the changelog. For a minor bump, also add a
+   `## <version>` section to [`MIGRATION.md`](MIGRATION.md) with before/after
+   code for each breaking change; the `docs` workflow fails a minor release
+   without one.
 5. **Compatibility matrix is current.** [`COMPATIBILITY.md`](COMPATIBILITY.md)
    documents the `soroban-sdk` and Stellar protocol version this release
    targets and passes CI's docs check. If the pinned `soroban-sdk` moved,
@@ -67,6 +70,27 @@ publish if any of them fail.
 10. **If the pinned `soroban-sdk` changed in this release**, make sure the
     weekly `scheduled-sdk-check` job is green against the new pin (it runs
     against whatever is latest on crates.io, independent of the pin).
+
+## Release assets
+
+The `Release` workflow builds the `soroban-testkit` CLI for each supported
+target and attaches the archives to the GitHub release:
+
+| Target | Runner | Archive |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | `ubuntu-latest` | `soroban-testkit-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| `x86_64-apple-darwin` | `macos-latest` (cross-compiled) | `soroban-testkit-<version>-x86_64-apple-darwin.tar.gz` |
+| `aarch64-apple-darwin` | `macos-latest` | `soroban-testkit-<version>-aarch64-apple-darwin.tar.gz` |
+| `x86_64-pc-windows-msvc` | `windows-latest` | `soroban-testkit-<version>-x86_64-pc-windows-msvc.tar.gz` |
+
+Each archive holds one binary, `soroban-testkit` (`soroban-testkit.exe` on
+Windows), and has a `.sha256` file beside it. To check a download, run
+`sha256sum -c soroban-testkit-<version>-<target>.tar.gz.sha256` in the folder
+that holds both files.
+
+Packaging is done by [`.github/scripts/package-cli.sh`](.github/scripts/package-cli.sh).
+To add a target, update the matrix in [`release.yml`](.github/workflows/release.yml),
+the target list in that script, and the table above in the same change.
 
 ## Manual publish (fallback)
 

@@ -89,6 +89,12 @@ section, so a merge can never land without a place to record the change.
   that probes up to N ramp values concurrently while doubling to the first
   failure. Results are read back in ramp order, so the reported boundary is
   the same as a sequential run. Binary refinement stays sequential.
+- Prebuilt `soroban-testkit` CLI archives for Linux x86_64, macOS x86_64 and
+  arm64, and Windows x86_64 are attached to each GitHub release, each with a
+  `.sha256` checksum.
+- `MIGRATION.md`, an API migration guide with one section per minor release.
+- `COMPATIBILITY.md` explains how to pin `soroban-testkit` and `soroban-sdk`
+  to a matching version, and what to do when the pins conflict.
 
 ### Changed
 
