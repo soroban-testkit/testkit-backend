@@ -1,0 +1,22 @@
+# Deliberately invalid issue form, used by ci.yml to prove that
+# check-issue-templates.rb rejects broken metadata. Expected errors:
+#   - `name` is empty
+#   - `description` is missing
+#   - `labels` is a string, not a list
+#   - body[0] and body[1] share the id `same`
+#   - body[2] is a dropdown with no options
+name: ""
+labels: "bug"
+body:
+  - type: input
+    id: same
+    attributes:
+      label: First
+  - type: input
+    id: same
+    attributes:
+      label: Second
+  - type: dropdown
+    id: pick
+    attributes:
+      label: Pick one

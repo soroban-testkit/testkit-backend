@@ -16,6 +16,39 @@ The `soroban-sdk` major version tracks the Stellar network protocol major
 version (SDK `27.0.x` ↔ protocol 27). Protocol reference:
 [Stellar network protocol history](https://stellar.expert/explorer/public/protocol-history).
 
+## Pinning a compatible version
+
+A testkit release is built against exactly one `soroban-sdk`. Your contract
+crate must resolve to that same `soroban-sdk`, or two copies of the SDK end up
+in the build and their types (`Env`, `Address`) stop matching. Pin both to the
+row in the matrix above that matches the release you use:
+
+```toml
+[dev-dependencies]
+soroban-testkit = "=0.1.0"   # once 0.1.0 is published
+soroban-sdk = { version = "=27.0.6", features = ["testutils"] }
+```
+
+The SDK major version is also the Stellar protocol version the release
+targets. Before choosing a row, check the protocol version of the network you
+deploy to: a contract built against a different protocol may not run there.
+
+Confirm that only one copy of the SDK is in the dependency graph:
+
+```sh
+cargo tree -i soroban-sdk
+```
+
+### When pinning fails
+
+- `failed to select a version for the requirement soroban-sdk`: two crates in
+  your workspace require different SDK versions. Make every crate use the
+  version from the matrix, or run `cargo update -p soroban-sdk --precise 27.0.6`.
+- `two different versions of crate soroban_sdk are being used`: `cargo tree -i
+  soroban-sdk` lists more than one version. Align them as above, then rebuild.
+- The pinned row no longer builds on your toolchain: check the Rust version in
+  the matrix's last column, and open an issue if the row itself is broken.
+
 ## Policy
 
 - Keep this matrix accurate in the same commit that bumps

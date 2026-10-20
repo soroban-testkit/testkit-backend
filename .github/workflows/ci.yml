@@ -84,6 +84,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  issue-templates:
+    name: issue template metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every issue template has valid metadata
+        run: ruby .github/scripts/check-issue-templates.rb
+      # Negative check: the fixture holds deliberately broken templates, so the
+      # checker must fail on it. Otherwise a checker that accepts everything
+      # would pass the step above.
+      - name: The checker rejects broken templates
+        run: |
+          if ruby .github/scripts/check-issue-templates.rb .github/scripts/testdata/invalid-templates; then
+            echo "check-issue-templates.rb accepted a template it should reject"
+            exit 1
+          fi
+
   coverage:
     name: code coverage
     runs-on: ubuntu-latest
