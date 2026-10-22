@@ -9,4 +9,4 @@ pub use crate::events::{CapturedEvent, EventLog};
 pub use crate::ledger::LedgerCheckpoint;
 pub use crate::money::{adversarial_amounts, amounts_in, bps_values, Conservation};
 pub use crate::tokens::TestToken;
-pub use crate::ttl::StorageKind;
+pub use crate::ttl::{SdkTtlCapabilities, StorageKind};
