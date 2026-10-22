@@ -1474,3 +1474,124 @@ fn audit_does_not_treat_integration_test_files_as_production() {
         .ends_with("tests/helpers.rs")));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ---- #419: no false positives for auth checks delegated to helper functions ----
+
+/// An entry point that delegates `require_auth` to a private helper must not
+/// be flagged as missing auth.  This is the most common pattern for sharing
+/// auth logic across multiple entry points in a contract.
+#[test]
+fn audit_does_not_flag_entry_points_that_delegate_auth_to_a_helper() {
+    let source = br#"
+fn check_auth(caller: &Address) {
+    caller.require_auth();
+}
+
+#[contractimpl]
+impl Vault {
+    pub fn withdraw(env: Env, from: Address) {
+        check_auth(&from);
+        let balance: i128 = env.storage().instance().get(&"bal").unwrap_or(0);
+        env.storage().instance().set(&"bal", &(balance - 1i128));
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json", "--strict"], source);
+    // strict must not fail — the entry point is auth-protected via helper
+    assert!(
+        output.status.success(),
+        "false positive: delegated auth helper still triggered missing-require-auth; \
+         stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let auth_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "missing-require-auth")
+        .collect();
+    assert!(
+        auth_findings.is_empty(),
+        "unexpected missing-require-auth findings: {auth_findings:?}"
+    );
+}
+
+/// Various naming conventions for auth helpers — all should suppress the finding.
+#[test]
+fn audit_recognises_multiple_auth_helper_naming_conventions() {
+    for (helper_decl, helper_call) in &[
+        (
+            "fn verify_auth(a: &Address) { a.require_auth(); }",
+            "verify_auth(&from);",
+        ),
+        (
+            "fn assert_authorized(a: &Address) { a.require_auth(); }",
+            "assert_authorized(&from);",
+        ),
+        (
+            "fn require_caller(a: &Address) { a.require_auth(); }",
+            "require_caller(&from);",
+        ),
+    ] {
+        let source = format!(
+            r#"
+{helper_decl}
+#[contractimpl]
+impl Vault {{
+    pub fn withdraw(env: Env, from: Address) {{
+        {helper_call}
+    }}
+}}
+"#
+        );
+        let output = run_with_stdin(
+            &["audit", "-", "--format", "json", "--strict"],
+            source.as_bytes(),
+        );
+        assert!(
+            output.status.success(),
+            "false positive for helper `{helper_call}`; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let auth_findings: Vec<_> = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["rule"] == "missing-require-auth")
+            .collect();
+        assert!(
+            auth_findings.is_empty(),
+            "unexpected findings for helper `{helper_call}`: {auth_findings:?}"
+        );
+    }
+}
+
+/// An unrelated helper (not auth-semantics) must not suppress the finding.
+#[test]
+fn audit_still_flags_entry_points_when_only_unrelated_helpers_are_called() {
+    let source = br#"
+fn process_payment(from: &Address) { /* no auth */ }
+
+#[contractimpl]
+impl Vault {
+    pub fn withdraw(env: Env, from: Address) {
+        process_payment(&from);
+    }
+}
+"#;
+    let output = run_with_stdin(&["audit", "-", "--format", "json"], source);
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let auth_findings: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "missing-require-auth")
+        .collect();
+    assert!(
+        !auth_findings.is_empty(),
+        "missing-require-auth should fire when only an unrelated helper is called"
+    );
+}

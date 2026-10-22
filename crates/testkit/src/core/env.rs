@@ -223,6 +223,42 @@ impl fmt::Display for EnvMetadata {
     }
 }
 
+impl EnvMetadata {
+    /// Format this metadata as a deterministic failure report section.
+    ///
+    /// Returns a stable, deterministic key-value block suitable for inclusion
+    /// in assertion failure diagnostics and CI bug reports.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::with_seed(123);
+    /// let report = env.metadata().to_failure_report();
+    /// assert!(report.contains("ledger_timestamp: 0"));
+    /// assert!(report.contains("env_seed: 123"));
+    /// ```
+    pub fn to_failure_report(&self) -> String {
+        let mut out = format!(
+            "deterministic environment metadata:\n  ledger_timestamp: {}\n  ledger_sequence: {}\n  protocol_version: {}\n  env_seed: {}",
+            self.timestamp, self.sequence, self.protocol_version, self.seed
+        );
+        if let Some(ci) = self.close_interval_override {
+            out.push_str(&format!("\n  close_interval_override: {ci}s"));
+        }
+        out
+    }
+
+    /// Short single-line context string for embedding inside formatted error messages.
+    pub fn failure_context(&self) -> String {
+        format!(
+            "timestamp={}, sequence={}, seed={}",
+            self.timestamp, self.sequence, self.seed
+        )
+    }
+}
+
 #[derive(Default)]
 struct LabelStore {
     address_to_label: Vec<(Address, String)>,
@@ -330,6 +366,11 @@ pub trait TestFixture: Sized {
     fn with_seed(seed: u64) -> Self {
         Self::from_env(TestEnv::with_seed(seed))
     }
+
+    /// Create a [`FixtureBuilder`] configured to construct this fixture type.
+    fn builder() -> FixtureBuilder<Self> {
+        FixtureBuilder::new()
+    }
 }
 
 impl TestFixture for TestEnv {
@@ -339,6 +380,144 @@ impl TestFixture for TestEnv {
 
     fn test_env(&self) -> &TestEnv {
         self
+    }
+}
+
+/// A reusable fixture builder for configuring and instantiating contract test fixtures.
+///
+/// `FixtureBuilder` allows test authors to declare initial seeds, ledger defaults,
+/// close intervals, and pre-seeded actor labels in a fluent builder before constructing
+/// the target fixture type `F: TestFixture`.
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::core::{FixtureBuilder, TestEnv, TestFixture};
+///
+/// let env = FixtureBuilder::new()
+///     .seed(42)
+///     .timestamp(1_000_000)
+///     .close_interval(5)
+///     .build();
+///
+/// assert_eq!(env.seed(), 42);
+/// assert_eq!(env.now(), 1_000_000);
+/// assert_eq!(env.ledger_close_interval(), 5);
+/// ```
+#[derive(Debug, Clone)]
+pub struct FixtureBuilder<F = TestEnv> {
+    seed: Option<u64>,
+    ledger_defaults: LedgerDefaults,
+    close_interval_secs: Option<u64>,
+    labels: Vec<String>,
+    _marker: std::marker::PhantomData<F>,
+}
+
+impl<F: TestFixture> Default for FixtureBuilder<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: TestFixture> FixtureBuilder<F> {
+    /// Create a new, unconfigured `FixtureBuilder`.
+    pub fn new() -> Self {
+        Self {
+            seed: None,
+            ledger_defaults: LedgerDefaults::default(),
+            close_interval_secs: None,
+            labels: Vec::new(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Configure the RNG seed for the test environment.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Set ledger defaults to establish starting parameters.
+    pub fn ledger_defaults(mut self, defaults: LedgerDefaults) -> Self {
+        self.ledger_defaults = defaults;
+        self
+    }
+
+    /// Set the initial ledger timestamp (unix seconds).
+    pub fn timestamp(mut self, timestamp: u64) -> Self {
+        self.ledger_defaults.timestamp = Some(timestamp);
+        self
+    }
+
+    /// Set the initial ledger sequence number.
+    pub fn sequence_number(mut self, sequence: u32) -> Self {
+        self.ledger_defaults.sequence_number = Some(sequence);
+        self
+    }
+
+    /// Set the initial protocol version.
+    pub fn protocol_version(mut self, protocol_version: u32) -> Self {
+        self.ledger_defaults.protocol_version = Some(protocol_version);
+        self
+    }
+
+    /// Set the initial base reserve in stroops.
+    pub fn base_reserve(mut self, base_reserve: u32) -> Self {
+        self.ledger_defaults.base_reserve = Some(base_reserve);
+        self
+    }
+
+    /// Set the ledger close interval override in seconds.
+    pub fn close_interval(mut self, secs: u64) -> Self {
+        self.close_interval_secs = Some(secs);
+        self
+    }
+
+    /// Pre-generate an address associated with the specified label when the fixture is built.
+    pub fn with_account_label(mut self, label: impl Into<String>) -> Self {
+        self.labels.push(label.into());
+        self
+    }
+
+    /// Attempt to build the configured fixture, returning [`TestkitError::Misuse`] if validation fails.
+    pub fn try_build(self) -> Result<F, TestkitError> {
+        let mut env = match self.seed {
+            Some(seed) => TestEnv::with_seed(seed),
+            None => TestEnv::new(),
+        };
+
+        if self.ledger_defaults.timestamp.is_some()
+            || self.ledger_defaults.sequence_number.is_some()
+            || self.ledger_defaults.protocol_version.is_some()
+            || self.ledger_defaults.base_reserve.is_some()
+        {
+            env = TestEnv::with_ledger_defaults(self.ledger_defaults);
+            if let Some(seed) = self.seed {
+                env.seed = seed;
+            }
+        }
+
+        if let Some(ci) = self.close_interval_secs {
+            if ci == 0 {
+                return Err(TestkitError::misuse("ledger close interval must be greater than zero"));
+            }
+            env.set_close_interval_override(ci);
+        }
+
+        for label in self.labels {
+            let trimmed = label.trim();
+            if trimmed.is_empty() {
+                return Err(TestkitError::misuse("address label cannot be empty or whitespace-only"));
+            }
+            env.address_with_label(trimmed);
+        }
+
+        Ok(F::from_env(env))
+    }
+
+    /// Build the configured fixture, panicking with actionable context if configuration is invalid.
+    pub fn build(self) -> F {
+        self.try_build().unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
@@ -1154,6 +1333,232 @@ impl TestEnv {
             close_interval_override: self.close_interval_secs,
         }
     }
+
+    /// Format this environment's deterministic metadata into a failure report string,
+    /// appending the provided failure details.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::with_seed(123);
+    /// let report = env.failure_report("assertion failed: token transfer failed");
+    /// assert!(report.contains("assertion failed: token transfer failed"));
+    /// assert!(report.contains("env_seed: 123"));
+    /// ```
+    pub fn failure_report(&self, failure_detail: &str) -> String {
+        format!("{failure_detail}\n\n{}", self.metadata().to_failure_report())
+    }
+
+    /// Create a [`FixtureBuilder`] configured to construct a `TestEnv`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::fixture_builder().seed(99).build();
+    /// assert_eq!(env.seed(), 99);
+    /// ```
+    pub fn fixture_builder() -> FixtureBuilder<TestEnv> {
+        FixtureBuilder::new()
+    }
+
+    /// Return the current stream position of the seeded address generator.
+    ///
+    /// Every call to [`TestEnv::address`] advances the generator position by 1.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::with_seed(42);
+    /// assert_eq!(env.generator_position(), 0);
+    /// let _ = env.address();
+    /// assert_eq!(env.generator_position(), 1);
+    /// ```
+    pub fn generator_position(&self) -> u64 {
+        self.address_counter.get()
+    }
+
+    /// Reset the seeded address generator back to its initial position (`0`).
+    ///
+    /// Subsequent calls to [`TestEnv::address`] will regenerate the exact same
+    /// sequence of addresses from the start of the stream for this environment's seed.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::with_seed(100);
+    /// let addr1 = env.address();
+    /// env.reset_generator();
+    /// let addr2 = env.address();
+    /// assert_eq!(addr1, addr2);
+    /// ```
+    pub fn reset_generator(&self) {
+        self.address_counter.set(0);
+    }
+
+    /// Attempt to reset the seeded generator to the initial position, returning `Ok(())`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::with_seed(100);
+    /// assert!(env.try_reset_generator().is_ok());
+    /// ```
+    pub fn try_reset_generator(&self) -> Result<(), TestkitError> {
+        self.reset_generator();
+        Ok(())
+    }
+
+    /// Attempt to reset the generator stream to a specific position `position`.
+    ///
+    /// Fails with [`TestkitError::Misuse`] if `position == u64::MAX`, since the
+    /// address generator counter would immediately be exhausted.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::with_seed(100);
+    /// env.try_reset_generator_to(5).unwrap();
+    /// assert_eq!(env.generator_position(), 5);
+    /// assert!(env.try_reset_generator_to(u64::MAX).is_err());
+    /// ```
+    pub fn try_reset_generator_to(&self, position: u64) -> Result<(), TestkitError> {
+        if position == u64::MAX {
+            return Err(TestkitError::misuse(
+                "cannot reset generator to exhausted position u64::MAX",
+            ));
+        }
+        self.address_counter.set(position);
+        Ok(())
+    }
+
+    /// Reset the generator stream to a specific position `position`, panicking with
+    /// actionable context if the position is invalid.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::with_seed(100);
+    /// env.reset_generator_to(10);
+    /// assert_eq!(env.generator_position(), 10);
+    /// ```
+    pub fn reset_generator_to(&self, position: u64) {
+        self.try_reset_generator_to(position).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Assert that this environment and another environment are completely independent instances.
+    ///
+    /// Panics with [`TestkitError::AssertionFailed`] if:
+    /// - Both references point to the same [`TestEnv`] memory address.
+    /// - Both environments share the same underlying [`soroban_sdk::Env`].
+    /// - Mutating the ledger clock or sequence on one environment affects the other.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let a = TestEnv::new();
+    /// let b = TestEnv::new();
+    /// a.assert_independent(&b);
+    /// ```
+    pub fn assert_independent(&self, other: &TestEnv) {
+        if let Err(e) = self.check_independent(other) {
+            panic!("{e}");
+        }
+    }
+
+    /// Check whether this environment and another environment are independent instances.
+    ///
+    /// Returns `Ok(())` if independent, or `Err(TestkitError::AssertionFailed)` with actionable
+    /// context if they share state or reference the same instance.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let a = TestEnv::new();
+    /// let b = TestEnv::new();
+    /// assert!(a.check_independent(&b).is_ok());
+    /// assert!(a.check_independent(&a).is_err());
+    /// ```
+    pub fn check_independent(&self, other: &TestEnv) -> Result<(), TestkitError> {
+        if std::ptr::eq(self, other) {
+            return Err(TestkitError::assertion_failed(
+                "environments are not independent: both references point to the exact same TestEnv instance",
+            ));
+        }
+        if std::ptr::eq(self.env(), other.env()) {
+            return Err(TestkitError::assertion_failed(
+                "environments are not independent: both references share the same underlying soroban_sdk::Env instance",
+            ));
+        }
+
+        let a_seq_orig = self.sequence();
+        let b_seq_orig = other.sequence();
+        let test_seq = a_seq_orig.wrapping_add(10_000).max(1);
+
+        self.env().ledger().set_sequence_number(test_seq);
+        let b_seq_after = other.sequence();
+        self.env().ledger().set_sequence_number(a_seq_orig);
+
+        if b_seq_after != b_seq_orig {
+            return Err(TestkitError::assertion_failed(format!(
+                "environments are not independent: mutating ledger sequence on first env altered the second env (expected {b_seq_orig}, observed {b_seq_after})",
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+/// Assert that two [`TestEnv`] instances are completely independent.
+///
+/// Convenience free function delegating to [`TestEnv::assert_independent`].
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::core::{assert_independent, TestEnv};
+///
+/// let a = TestEnv::new();
+/// let b = TestEnv::new();
+/// assert_independent(&a, &b);
+/// ```
+pub fn assert_independent(a: &TestEnv, b: &TestEnv) {
+    a.assert_independent(b);
+}
+
+/// Check that two [`TestEnv`] instances are completely independent.
+///
+/// Convenience free function delegating to [`TestEnv::check_independent`].
+///
+/// # Example
+///
+/// ```
+/// use soroban_testkit::core::{check_independent, TestEnv};
+///
+/// let a = TestEnv::new();
+/// let b = TestEnv::new();
+/// assert!(check_independent(&a, &b).is_ok());
+/// assert!(check_independent(&a, &a).is_err());
+/// ```
+pub fn check_independent(a: &TestEnv, b: &TestEnv) -> Result<(), TestkitError> {
+    a.check_independent(b)
 }
 
 impl Default for TestEnv {
@@ -1367,6 +1772,39 @@ impl<'a> AddressIter<'a> {
     /// ```
     pub fn new(env: &'a TestEnv) -> Self {
         Self { env }
+    }
+
+    /// Reset the underlying generator stream back to the beginning (`0`).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::with_seed(123);
+    /// let mut iter = env.address_iter();
+    /// let a1 = iter.next().unwrap();
+    /// iter.reset();
+    /// let a2 = iter.next().unwrap();
+    /// assert_eq!(a1, a2);
+    /// ```
+    pub fn reset(&mut self) {
+        self.env.reset_generator();
+    }
+
+    /// Return the current stream position of the generator.
+    pub fn position(&self) -> u64 {
+        self.env.generator_position()
+    }
+
+    /// Reset the generator stream to a specific position `position`.
+    pub fn reset_to(&mut self, position: u64) {
+        self.env.reset_generator_to(position);
+    }
+
+    /// Attempt to reset the generator stream to a specific position `position`.
+    pub fn try_reset_to(&mut self, position: u64) -> Result<(), TestkitError> {
+        self.env.try_reset_generator_to(position)
     }
 }
 

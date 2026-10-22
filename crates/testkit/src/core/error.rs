@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt;
 
+use super::env::EnvMetadata;
+
 /// Errors raised by testkit assertion helpers and setup routines.
 ///
 /// Assertion helpers throughout this crate panic deliberately when a
@@ -466,6 +468,42 @@ impl TestkitError {
     /// ```
     pub fn chain(&self) -> Vec<&(dyn Error + 'static)> {
         source_chain(self)
+    }
+
+    /// Attach deterministic environment metadata to this error's context.
+    ///
+    /// Preserves the underlying error as the standard source while formatting
+    /// the environment metadata clearly in the error chain.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::{TestEnv, TestkitError};
+    ///
+    /// let env = TestEnv::with_seed(42);
+    /// let err = TestkitError::assertion_failed("balance underflow")
+    ///     .with_env_metadata(&env.metadata());
+    /// assert!(err.to_string().contains("seed=42"));
+    /// ```
+    pub fn with_env_metadata(self, metadata: &EnvMetadata) -> Self {
+        self.with_context(format!("environment metadata: [{}]", metadata.failure_context()))
+    }
+
+    /// Format this error together with the provided environment metadata as an actionable failure report.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::{TestEnv, TestkitError};
+    ///
+    /// let env = TestEnv::with_seed(42);
+    /// let err = TestkitError::assertion_failed("transfer failed");
+    /// let report = err.to_failure_report(&env.metadata());
+    /// assert!(report.contains("assertion failed: transfer failed"));
+    /// assert!(report.contains("env_seed: 42"));
+    /// ```
+    pub fn to_failure_report(&self, metadata: &EnvMetadata) -> String {
+        format!("{}\n\n{}", self, metadata.to_failure_report())
     }
 }
 

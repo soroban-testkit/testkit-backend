@@ -38,6 +38,18 @@ jobs:
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           grep -Fq "$version" COMPATIBILITY.md \
             || { echo "COMPATIBILITY.md does not list the current workspace version ($version)."; exit 1; }
+          grep -Fq "\"=$sdk\"" COMPATIBILITY.md \
+            || { echo "COMPATIBILITY.md should show the exact pin \"=$sdk\" in its pinning example; update it with the pin."; exit 1; }
+
+      - name: Minor releases have an API migration guide section
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          patch="${version##*.}"
+          if [ "$patch" = "0" ]; then
+            test -f MIGRATION.md || { echo "MIGRATION.md is missing; minor release $version needs an API migration guide."; exit 1; }
+            grep -Fxq "## $version" MIGRATION.md \
+              || { echo "MIGRATION.md has no \"## $version\" heading. Add the migration notes for this minor release."; exit 1; }
+          fi
           spec="$(sed -n 's/^soroban-spec = "\(.*\)"/\1/p' crates/cli/Cargo.toml | head -1)"
           if [ -n "$spec" ] && [ "$spec" != "$sdk" ]; then
             echo "crates/cli/Cargo.toml pinned soroban-spec ($spec) does not match workspace soroban-sdk ($sdk); update both on SDK bump."; exit 1;

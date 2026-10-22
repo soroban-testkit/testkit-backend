@@ -551,19 +551,25 @@ Use `clap` with derive. Three subcommands, built in this order.
 Wraps coverage collection for the WASM target, which does not work out of the box.
 
 ```
-soroban-testkit coverage [--format text|lcov|html|json] [--fail-under <pct>] [--open]
+soroban-testkit coverage [--format text|lcov|html|json] [--fail-under <pct>] [--open] [--exclude-generated] [--ignore-filename-regex <regex> ...] [--no-clean]
 ```
 
 Shells out to the underlying coverage tool. Its job is knowing the right flags for Soroban's target, not reimplementing coverage.
 JSON mode writes machine-readable cargo-llvm-cov output to `coverage.json` by default, or to `--output <path>`. When only `--output-dir` is provided, it writes `<dir>/coverage.json`. `--open` is HTML-only.
+
+`--exclude-generated` leaves out files under `generated/` or `fixtures/` directories and files named `*_generated.rs`. `--ignore-filename-regex` leaves out any other source paths matching a regex. Both become a single `--ignore-filename-regex` argument to cargo-llvm-cov. `--no-clean` passes `--no-clean` so profile data from earlier runs is kept for incremental collection.
+
+When cargo-llvm-cov exits non-zero, nothing is deleted. The error lists any output files still on disk and says they were not validated, since they may be partial or left over from an earlier run.
 
 ### `soroban-testkit limits`
 
 Empirically discovers resource ceilings rather than guessing them.
 
 ```
-soroban-testkit limits --contract <path-to-wasm> --fn <name> --ramp <param> [--arg <name=value> ...]
+soroban-testkit limits --contract <path-to-wasm> --fn <name> --ramp <param> [--arg <name=value> ...] [--jobs <n>]
 ```
+
+`--jobs <n>` (1 to 8, default 1) is opt-in. It probes up to `n` consecutive ramp values concurrently while doubling, and reads results back in ramp order, stopping at the first failure. The reported boundary matches a sequential run. Probes past the first failure still run to completion but are discarded. Binary refinement always runs one probe at a time.
 
 The contract path must point to an existing compiled WASM file; `limits` does not
 build contracts. Chain your build and limits invocation with `&&` so a failed
@@ -669,3 +675,11 @@ Every issue must state: the problem, affected file paths, expected behavior, acc
 Label taxonomy: `good-first-issue`, `help-wanted`, `module/core`, `module/money`, `module/events`, `module/auth`, `module/ttl`, `module/cli`, `docs`, `size/s`, `size/m`, `size/l`.
 
 **Difficulty guidance:** Modules 3, 4, 5, and the `audit` rules are good first issues. Module 7 is not — do not label TTL work as beginner-friendly.
+
+## Coverage tool support
+
+The `coverage` command delegates collection to `cargo-llvm-cov`, which is the supported coverage tool for the Soroban WASM target. Keep the tool installed from its current stable release and verify compatibility with the repository's pinned Rust toolchain before running coverage locally or in CI.
+
+Use the same tool and format flags in local and CI workflows so text, LCOV, HTML, and JSON reports describe the same instrumented target. If `cargo-llvm-cov` is unavailable, the command should report that prerequisite clearly and include the installation or version-check guidance instead of failing with an opaque shell error.
+
+Coverage collection is separate from the normal test runner: run the workspace tests first, then invoke the coverage command for the report format required by the workflow. This keeps tool availability, target setup, and report generation failures distinguishable.

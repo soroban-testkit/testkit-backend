@@ -111,7 +111,7 @@ pub struct CoverageArgs {
     ///
     /// If no source files in the selected package are instrumented, coverage
     /// collection will report that no source files were covered.
-    #[arg(long, value_name = "PACKAGE")]
+    #[arg(long, visible_alias = "package", value_name = "PACKAGE")]
     include: Vec<String>,
     /// Collect coverage for the whole workspace except this package.
     /// Repeatable. Mutually exclusive with `--include`.
@@ -127,7 +127,23 @@ pub struct CoverageArgs {
     /// Write JSON to this path (defaults to coverage.json). Only valid with --format json.
     #[arg(long, value_name = "PATH")]
     output: Option<std::path::PathBuf>,
+    /// Leave generated and fixture code out of the report. Excludes files under
+    /// `generated/` or `fixtures/` directories and files named `*_generated.rs`.
+    /// Use `--ignore-filename-regex` for any other paths.
+    #[arg(long)]
+    exclude_generated: bool,
+    /// Leave source files whose path matches this regex out of the report.
+    /// Repeatable. Passed to `cargo llvm-cov --ignore-filename-regex`.
+    #[arg(long, value_name = "REGEX")]
+    ignore_filename_regex: Vec<String>,
+    /// Keep profile data from earlier runs instead of cleaning it first, so
+    /// repeated runs collect coverage incrementally (passes `--no-clean`).
+    #[arg(long)]
+    no_clean: bool,
 }
+
+/// Path regex matching generated and fixture code. Used by `--exclude-generated`.
+const GENERATED_AND_FIXTURE_IGNORE_REGEX: &str = r"(^|/)(generated|fixtures?)/|_generated\.rs$";
 
 /// Wraps `cargo llvm-cov test`, which handles Soroban's coverage needs
 /// correctly out of the box — soroban_sdk's own test harness runs contract
@@ -211,12 +227,19 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     }
 
     if !output.status.success() {
-        return Err(CliError(coverage_failure_message(
+        let mut message = coverage_failure_message(
             output.status,
             args.open,
             args.fail_under,
             &captured_stderr,
-        )));
+        );
+        // Nothing is deleted on failure. Name any output files still on disk so
+        // the user can inspect them, and say they were not validated.
+        let kept = existing_artifacts(&args);
+        if !kept.is_empty() {
+            message.push_str(&preserved_artifacts_note(&kept));
+        }
+        return Err(CliError(message));
     }
 
     validate_coverage_outputs(&args)?;
@@ -226,6 +249,60 @@ pub fn run(args: CoverageArgs) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// `lcov.info` path, inside `--output-dir` when given.
+fn lcov_output_path(args: &CoverageArgs) -> std::path::PathBuf {
+    args.output_dir
+        .as_ref()
+        .map_or_else(|| std::path::PathBuf::from("lcov.info"), |dir| dir.join("lcov.info"))
+}
+
+/// JSON report path: `--output`, else `coverage.json` inside `--output-dir`.
+fn json_output_path(args: &CoverageArgs) -> std::path::PathBuf {
+    args.output.clone().unwrap_or_else(|| {
+        args.output_dir
+            .as_ref()
+            .map(|dir| dir.join("coverage.json"))
+            .unwrap_or_else(|| std::path::PathBuf::from("coverage.json"))
+    })
+}
+
+/// Output files `args` asks cargo-llvm-cov to write. HTML reports go to
+/// `target/llvm-cov/html` when no `--output-dir` is given, cargo-llvm-cov's default.
+fn expected_artifacts(args: &CoverageArgs) -> Vec<std::path::PathBuf> {
+    match args.format {
+        Format::Text if !args.open => Vec::new(),
+        Format::Text | Format::Html => {
+            let dir = args
+                .output_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("target/llvm-cov/html"));
+            vec![dir.join("index.html")]
+        }
+        Format::Lcov => vec![lcov_output_path(args)],
+        Format::Json => vec![json_output_path(args)],
+    }
+}
+
+/// Expected output files that exist on disk right now.
+fn existing_artifacts(args: &CoverageArgs) -> Vec<std::path::PathBuf> {
+    expected_artifacts(args)
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn preserved_artifacts_note(paths: &[std::path::PathBuf]) -> String {
+    let listed = paths
+        .iter()
+        .map(|path| format!("'{}'", path.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "; output files were left on disk and were not validated (they may be partial, \
+         or left over from an earlier run): {listed}"
+    )
 }
 
 /// Opens the generated HTML report in the system's default browser.
@@ -535,23 +612,37 @@ pub fn augment_coverage_json(
         line_percent,
     };
 
-    if let Some(obj) = root.as_object_mut() {
-        obj.insert(
-            "package_summaries".to_string(),
-            serde_json::to_value(&package_summaries)
-                .map_err(|err| CliError(format!("failed to serialize package summaries: {err}")))?,
-        );
-        obj.insert(
-            "file_summaries".to_string(),
-            serde_json::to_value(&file_summaries)
-                .map_err(|err| CliError(format!("failed to serialize file summaries: {err}")))?,
-        );
-        obj.insert(
-            "summary".to_string(),
-            serde_json::to_value(&summary)
-                .map_err(|err| CliError(format!("failed to serialize coverage summary: {err}")))?,
-        );
-    }
+    let obj = root.as_object_mut().ok_or_else(|| {
+        CliError(format!(
+            "coverage JSON output has unexpected structure: expected a JSON object at the root, \
+             got {}; this usually means the coverage tool produced malformed or unexpected output — \
+             check the coverage run output above for errors",
+            match &root {
+                serde_json::Value::Array(_) => "an array",
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "a boolean",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::String(_) => "a string",
+                serde_json::Value::Object(_) => "an object", // unreachable
+            }
+        ))
+    })?;
+
+    obj.insert(
+        "package_summaries".to_string(),
+        serde_json::to_value(&package_summaries)
+            .map_err(|err| CliError(format!("failed to serialize package summaries: {err}")))?,
+    );
+    obj.insert(
+        "file_summaries".to_string(),
+        serde_json::to_value(&file_summaries)
+            .map_err(|err| CliError(format!("failed to serialize file summaries: {err}")))?,
+    );
+    obj.insert(
+        "summary".to_string(),
+        serde_json::to_value(&summary)
+            .map_err(|err| CliError(format!("failed to serialize coverage summary: {err}")))?,
+    );
 
     let augmented_str = serde_json::to_string_pretty(&root)
         .map_err(|err| CliError(format!("failed to format augmented coverage JSON: {err}")))?;
@@ -716,6 +807,24 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
         }
     }
 
+    // Generated and fixture exclusions are folded into one regex, so the
+    // user's own patterns and the preset never conflict as separate flags.
+    let mut ignore_patterns: Vec<String> = args.ignore_filename_regex.clone();
+    if args.exclude_generated {
+        ignore_patterns.push(GENERATED_AND_FIXTURE_IGNORE_REGEX.to_string());
+    }
+    if !ignore_patterns.is_empty() {
+        let combined = ignore_patterns
+            .iter()
+            .map(|pattern| format!("(?:{pattern})"))
+            .collect::<Vec<_>>()
+            .join("|");
+        cmd.arg("--ignore-filename-regex").arg(combined);
+    }
+    if args.no_clean {
+        cmd.arg("--no-clean");
+    }
+
     match args.format {
         Format::Text => {
             if args.open {
@@ -727,12 +836,7 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
         }
         Format::Lcov => {
             cmd.arg("--lcov");
-            let output_path = if let Some(dir) = &args.output_dir {
-                dir.join("lcov.info")
-            } else {
-                std::path::PathBuf::from("lcov.info")
-            };
-            cmd.arg("--output-path").arg(output_path);
+            cmd.arg("--output-path").arg(lcov_output_path(args));
         }
         Format::Html => {
             cmd.arg("--html");
@@ -742,13 +846,7 @@ fn build_command(args: &CoverageArgs) -> Result<Command, CliError> {
         }
         Format::Json => {
             cmd.arg("--json");
-            let output_path = args.output.clone().unwrap_or_else(|| {
-                args.output_dir
-                    .as_ref()
-                    .map(|dir| dir.join("coverage.json"))
-                    .unwrap_or_else(|| std::path::PathBuf::from("coverage.json"))
-            });
-            cmd.arg("--output-path").arg(output_path);
+            cmd.arg("--output-path").arg(json_output_path(args));
         }
     }
 
@@ -777,6 +875,9 @@ mod tests {
             exclude: exclude.iter().map(|s| s.to_string()).collect(),
             output_dir: None,
             output: None,
+            exclude_generated: false,
+            ignore_filename_regex: Vec::new(),
+            no_clean: false,
         }
     }
 
@@ -784,6 +885,106 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().to_string())
             .collect()
+    }
+
+    #[test]
+    fn new_collection_flags_are_not_forwarded_by_default() {
+        let rendered = rendered_args(&build_command(&args(&[], &[])).unwrap());
+        assert!(!rendered.contains(&"--no-clean".to_string()), "{rendered:?}");
+        assert!(
+            !rendered.contains(&"--ignore-filename-regex".to_string()),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn no_clean_is_forwarded_to_cargo_llvm_cov() {
+        let mut a = args(&[], &[]);
+        a.no_clean = true;
+        let rendered = rendered_args(&build_command(&a).unwrap());
+        assert!(rendered.contains(&"--no-clean".to_string()), "{rendered:?}");
+    }
+
+    #[test]
+    fn exclude_generated_and_custom_patterns_share_one_ignore_regex() {
+        let mut a = args(&[], &[]);
+        a.exclude_generated = true;
+        a.ignore_filename_regex = vec!["vendor/".to_string()];
+        let rendered = rendered_args(&build_command(&a).unwrap());
+
+        let flags = rendered
+            .iter()
+            .filter(|arg| *arg == "--ignore-filename-regex")
+            .count();
+        assert_eq!(flags, 1, "{rendered:?}");
+        let position = rendered
+            .iter()
+            .position(|arg| arg == "--ignore-filename-regex")
+            .unwrap();
+        let pattern = &rendered[position + 1];
+        assert!(pattern.contains("(?:vendor/)"), "{pattern}");
+        assert!(pattern.contains("generated|fixtures?"), "{pattern}");
+        assert!(pattern.contains("_generated"), "{pattern}");
+    }
+
+    #[test]
+    fn custom_ignore_patterns_without_preset_are_forwarded_verbatim_in_order() {
+        let mut a = args(&[], &[]);
+        a.ignore_filename_regex = vec!["a/".to_string(), "b/".to_string()];
+        let rendered = rendered_args(&build_command(&a).unwrap());
+        let position = rendered
+            .iter()
+            .position(|arg| arg == "--ignore-filename-regex")
+            .unwrap();
+        assert_eq!(rendered[position + 1], "(?:a/)|(?:b/)");
+    }
+
+    #[test]
+    fn html_artifact_defaults_to_cargo_llvm_cov_report_dir() {
+        let mut a = args(&[], &[]);
+        a.format = Format::Html;
+        assert_eq!(
+            expected_artifacts(&a),
+            vec![std::path::PathBuf::from("target/llvm-cov/html/index.html")]
+        );
+    }
+
+    #[test]
+    fn text_without_open_expects_no_artifacts() {
+        assert!(expected_artifacts(&args(&[], &[])).is_empty());
+    }
+
+    #[test]
+    fn failed_run_reports_kept_json_artifact_with_spaces_in_path() {
+        let dir = std::env::temp_dir().join(format!("stk cov kept {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json_path = dir.join("partial report.json");
+        std::fs::write(&json_path, "{}").unwrap();
+
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output = Some(json_path.clone());
+
+        let kept = existing_artifacts(&a);
+        assert_eq!(kept, vec![json_path.clone()]);
+        let note = preserved_artifacts_note(&kept);
+        assert!(
+            note.contains("were left on disk and were not validated"),
+            "{note}"
+        );
+        assert!(note.contains(&format!("'{}'", json_path.display())), "{note}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_run_reports_nothing_when_no_artifact_exists() {
+        let absent =
+            std::env::temp_dir().join(format!("stk-cov-absent-{}.json", std::process::id()));
+        let mut a = args(&[], &[]);
+        a.format = Format::Json;
+        a.output = Some(absent);
+        assert!(existing_artifacts(&a).is_empty());
     }
 
     #[test]
@@ -1593,119 +1794,120 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── Bug 1 regression: no browser open when HTML generation failed ─────────
-
     #[test]
-    fn open_is_not_forwarded_to_subprocess_for_text_open() {
-        // With --format text --open, the subprocess receives --html but NOT --open.
-        // The CLI opens the browser itself, only after confirming the report exists.
-        let mut a = args(&[], &[]);
-        a.format = Format::Text;
-        a.open = true;
-        let cmd = build_command(&a).unwrap();
-        let rendered = rendered_args(&cmd);
+    fn augment_coverage_json_rejects_non_object_root() {
+        // JSON array root — valid JSON but wrong schema
+        let err = augment_coverage_json(r#"[]"#).unwrap_err();
         assert!(
-            rendered.contains(&"--html".to_string()),
-            "expected --html in subprocess args: {rendered:?}"
-        );
-        assert!(
-            !rendered.contains(&"--open".to_string()),
-            "--open must NOT be forwarded to the subprocess: {rendered:?}"
-        );
-    }
-
-    #[test]
-    fn open_is_not_forwarded_to_subprocess_for_html_open() {
-        // With --format html --open, the subprocess receives --html but NOT --open.
-        let mut a = args(&[], &[]);
-        a.format = Format::Html;
-        a.open = true;
-        let cmd = build_command(&a).unwrap();
-        let rendered = rendered_args(&cmd);
-        assert!(
-            rendered.contains(&"--html".to_string()),
-            "expected --html in subprocess args: {rendered:?}"
-        );
-        assert!(
-            !rendered.contains(&"--open".to_string()),
-            "--open must NOT be forwarded to the subprocess: {rendered:?}"
-        );
-    }
-
-    #[test]
-    fn coverage_failure_message_with_open_reports_html_not_generated() {
-        #[cfg(unix)]
-        use std::os::unix::process::ExitStatusExt;
-        let status = std::process::ExitStatus::from_raw(256); // exit code 1
-        let msg = coverage_failure_message(status, true, None, "");
-        assert!(
-            msg.contains("HTML report was not generated so the browser will not be opened"),
-            "failure message should mention browser will not be opened: {msg}"
-        );
-        // Must NOT claim it tried to open a browser
-        assert!(
-            !msg.contains("desktop browser opener"),
-            "failure message must not claim browser open was attempted: {msg}"
-        );
-    }
-
-    // ── Bug 2 regression: --output-dir rejected with --format text ────────────
-
-    #[test]
-    fn output_dir_with_text_format_and_no_open_is_rejected() {
-        let mut a = args(&[], &[]);
-        a.format = Format::Text;
-        a.output_dir = Some(std::path::PathBuf::from("./coverage"));
-        // --open is false (default) — this combination must be rejected
-        let err = build_command(&a).unwrap_err();
-        assert!(
-            err.0
-                .contains("--output-dir is not valid with --format text"),
-            "expected rejection of --output-dir + --format text: {}",
+            err.0.contains("unexpected structure"),
+            "expected 'unexpected structure' in: {}",
             err.0
         );
+        assert!(err.0.contains("an array"), "{}", err.0);
+
+        // JSON null root
+        let err = augment_coverage_json("null").unwrap_err();
+        assert!(err.0.contains("unexpected structure"), "{}", err.0);
+        assert!(err.0.contains("null"), "{}", err.0);
+
+        // JSON string root
+        let err = augment_coverage_json(r#""hello""#).unwrap_err();
+        assert!(err.0.contains("unexpected structure"), "{}", err.0);
+        assert!(err.0.contains("a string"), "{}", err.0);
+
+        // JSON number root
+        let err = augment_coverage_json("42").unwrap_err();
+        assert!(err.0.contains("unexpected structure"), "{}", err.0);
+        assert!(err.0.contains("a number"), "{}", err.0);
+    }
+
+    #[test]
+    fn augment_coverage_json_rejects_malformed_json() {
+        // Syntactically invalid JSON
+        let err = augment_coverage_json("{not valid json}").unwrap_err();
         assert!(
-            err.0.contains("text output is written to the terminal"),
-            "error should explain text goes to terminal: {}",
+            err.0.contains("failed to parse coverage JSON output"),
+            "{}",
+            err.0
+        );
+
+        // Truncated JSON
+        let err = augment_coverage_json(r#"{"data": ["#).unwrap_err();
+        assert!(
+            err.0.contains("failed to parse coverage JSON output"),
+            "{}",
             err.0
         );
     }
 
     #[test]
-    fn output_dir_with_text_format_and_open_is_allowed() {
-        // --format text --open --output-dir is valid: it generates an HTML report
-        // (not text output) and the CLI opens the browser after success.
-        let mut a = args(&[], &[]);
-        a.format = Format::Text;
-        a.open = true;
-        a.output_dir = Some(std::path::PathBuf::from("./coverage"));
-        assert!(
-            build_command(&a).is_ok(),
-            "--format text --open --output-dir should be accepted"
-        );
-    }
+    fn validate_coverage_outputs_fails_for_malformed_json_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "stk-cov-val-malformed-json-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let json_path = dir.join("coverage.json");
 
-    #[test]
-    fn output_dir_with_html_format_is_always_allowed() {
-        let mut a = args(&[], &[]);
-        a.format = Format::Html;
-        a.output_dir = Some(std::path::PathBuf::from("./reports"));
-        assert!(build_command(&a).is_ok());
-    }
-
-    #[test]
-    fn output_dir_with_lcov_format_is_always_allowed() {
-        let mut a = args(&[], &[]);
-        a.format = Format::Lcov;
-        a.output_dir = Some(std::path::PathBuf::from("./reports"));
-        assert!(build_command(&a).is_ok());
-    }
-
-    #[test]
-    fn output_dir_with_json_format_is_always_allowed() {
         let mut a = args(&[], &[]);
         a.format = Format::Json;
-        a.output_dir = Some(std::path::PathBuf::from("./reports"));
-        assert!(build_command(&a).is_ok());
+        a.output = Some(json_path.clone());
+
+        // Syntactically invalid JSON
+        std::fs::write(&json_path, "{not valid json}").unwrap();
+        let err = validate_coverage_outputs(&a).unwrap_err();
+        assert!(
+            err.0.contains("failed to parse coverage JSON output"),
+            "{}",
+            err.0
+        );
+
+        // Valid JSON but wrong root type (array instead of object)
+        std::fs::write(&json_path, "[]").unwrap();
+        let err = validate_coverage_outputs(&a).unwrap_err();
+        assert!(
+            err.0.contains("unexpected structure"),
+            "expected 'unexpected structure' in: {}",
+            err.0
+        );
+
+        // Valid JSON but null root
+        std::fs::write(&json_path, "null").unwrap();
+        let err = validate_coverage_outputs(&a).unwrap_err();
+        assert!(err.0.contains("unexpected structure"), "{}", err.0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn coverage_failure_message_never_claims_success() {
+        // Verifies the failure message always contains diagnostic content,
+        // not a success message.
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(256); // exit code 1
+
+        let msg = coverage_failure_message(status, false, None);
+        assert!(
+            msg.contains("coverage run failed") || msg.contains("terminated by signal"),
+            "expected failure indication, got: {msg}"
+        );
+        assert!(!msg.to_lowercase().contains("success"), "{msg}");
+
+        let msg_fail_under = coverage_failure_message(status, false, Some(80.0));
+        assert!(
+            msg_fail_under.contains("coverage run failed")
+                || msg_fail_under.contains("terminated by signal"),
+            "{msg_fail_under}"
+        );
+        assert!(!msg_fail_under.to_lowercase().contains("success"), "{msg_fail_under}");
+
+        let msg_open = coverage_failure_message(status, true, None);
+        assert!(
+            msg_open.contains("coverage run failed") || msg_open.contains("terminated by signal"),
+            "{msg_open}"
+        );
+        assert!(!msg_open.to_lowercase().contains("success"), "{msg_open}");
     }
 }

@@ -30,6 +30,9 @@ section, so a merge can never land without a place to record the change.
 
 ### Added
 
+- Coverage accepts repeatable `--include`/`--package` and `--exclude` flags
+  to select workspace packages for targeted runs.
+
 - Core test environment: `TestEnv` with deterministic seeding
   (`with_seed`), random address generation, and a `TestkitError` type that
   every assertion helper panics with.
@@ -78,9 +81,25 @@ section, so a merge can never land without a place to record the change.
 - `AuthMatrix::known_actors` exposes the de-duplicated union of every entry
   point's `allowed` addresses, making explicit which callers the matrix
   cross-checks.
+- `soroban-testkit coverage` gains `--exclude-generated` (leaves out
+  `generated/` and `fixtures/` directories and `*_generated.rs` files),
+  `--ignore-filename-regex <REGEX>` for any other paths (repeatable), and
+  `--no-clean` to keep profile data between runs for incremental collection.
+- `soroban-testkit limits` gains an opt-in `--jobs <N>` (1 to 8, default 1)
+  that probes up to N ramp values concurrently while doubling to the first
+  failure. Results are read back in ramp order, so the reported boundary is
+  the same as a sequential run. Binary refinement stays sequential.
+- Prebuilt `soroban-testkit` CLI archives for Linux x86_64, macOS x86_64 and
+  arm64, and Windows x86_64 are attached to each GitHub release, each with a
+  `.sha256` checksum.
+- `MIGRATION.md`, an API migration guide with one section per minor release.
+- `COMPATIBILITY.md` explains how to pin `soroban-testkit` and `soroban-sdk`
+  to a matching version, and what to do when the pins conflict.
 
 ### Changed
 
+- A failed `soroban-testkit coverage` run now names any output files still on
+  disk and states that they were not validated. Nothing is deleted on failure.
 - `AuthMatrix` failure reports now state the definition of a "known actor",
   and event-capture failure diagnostics render the captured topics and data
   in decoded form so they line up with the raw captured values. The signed

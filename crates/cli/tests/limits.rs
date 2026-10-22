@@ -81,6 +81,7 @@ fn limits_help_documents_options_and_limitations() {
     assert!(stdout.contains("--ramp"), "{stdout}");
     assert!(stdout.contains("--arg"), "{stdout}");
     assert!(stdout.contains("--probe-timeout"), "{stdout}");
+    assert!(stdout.contains("--jobs"), "{stdout}");
     assert!(stdout.contains("--baseline"), "{stdout}");
     assert!(stdout.contains("--baseline-tolerance-pct"), "{stdout}");
     assert!(stdout.contains("--save-baseline"), "{stdout}");

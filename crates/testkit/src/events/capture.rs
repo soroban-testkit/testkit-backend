@@ -66,6 +66,41 @@ impl CapturedEvent {
             .map(|t| decode_topic_diagnostic(env, t))
             .collect()
     }
+
+    /// Structured debug formatting for this event's captured values.
+    ///
+    /// Returns a multi-line string with indented sections for the contract,
+    /// topics, and data — each rendered with its type tag and decoded value.
+    /// Useful for logging, test failure output, and inspecting event
+    /// contents in CI logs.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let log = env.events();
+    /// assert!(log.is_empty());
+    /// ```
+    pub fn debug_format(&self, env: &Env) -> String {
+        let mut out = String::new();
+        out.push_str("CapturedEvent {\n");
+        out.push_str(&format!("  contract: {:?},\n", self.contract));
+        out.push_str(&format!("  topics: [{}],\n", if self.topics.is_empty() {
+            String::new()
+        } else {
+            let rendered: Vec<String> = self
+                .topics
+                .iter()
+                .map(|t| format!("\n    {}", decode_topic_diagnostic(env, t)))
+                .collect();
+            rendered.join(",")
+        }));
+        out.push_str(&format!("  data: {},\n", decode_val_diagnostic(env, &self.data)));
+        out.push('}');
+        out
+    }
 }
 
 /// A filterable, assertable log of captured contract events.
@@ -227,6 +262,39 @@ impl EventLog {
     pub fn diagnostics(&self) -> String {
         self.render()
     }
+
+    /// Structured debug formatting for all captured events in this log.
+    ///
+    /// Returns a multi-line string with one formatted event per block.
+    /// Empty logs render as a single line.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let log = env.events();
+    /// let formatted = log.debug_format();
+    /// assert!(formatted.contains("EventLog"));
+    /// ```
+    pub fn debug_format(&self) -> String {
+        if self.events.is_empty() {
+            return "EventLog {\n  events: (none),\n}".to_string();
+        }
+        let mut out = String::from("EventLog {\n  events: [\n");
+        for (i, event) in self.events.iter().enumerate() {
+            let rendered = event.debug_format(&self.env);
+            for line in rendered.lines() {
+                out.push_str(&format!("    {line}\n"));
+            }
+            if i < self.events.len() - 1 {
+                out.push_str(",\n");
+            }
+        }
+        out.push_str("  ],\n}");
+        out
+    }
 }
 
 /// Decode a topic `Val` into a human-readable diagnostic string without panicking.
@@ -378,5 +446,23 @@ mod capture_tests {
             .events()
             .with_topic(soroban_sdk::symbol_short!("nope"))
             .is_empty());
+    }
+
+    #[test]
+    fn debug_format_empty_log_renders_none() {
+        let env = TestEnv::new();
+        let log = env.events();
+        let formatted = log.debug_format();
+        assert!(formatted.contains("EventLog"));
+        assert!(formatted.contains("(none)"));
+    }
+
+    #[test]
+    fn debug_format_contains_event_structure() {
+        let env = TestEnv::new();
+        let log = env.events();
+        let formatted = log.debug_format();
+        assert!(formatted.contains("EventLog"));
+        assert!(formatted.contains("events:"));
     }
 }

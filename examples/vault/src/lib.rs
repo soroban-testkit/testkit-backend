@@ -11,6 +11,9 @@ pub enum DataKey {
     Record,
     /// A temporary record used to demonstrate expiry handling.
     Temp,
+    /// The trusted Treasury contract address used for cross-contract
+    /// payouts via `delegate_payout`. Set once by the owner.
+    Treasury,
 }
 
 /// Errors this contract returns from its `try_*` entry points.
@@ -20,6 +23,8 @@ pub enum DataKey {
 pub enum VaultError {
     NotInitialized = 1,
     InsufficientBalance = 2,
+    Unauthorized = 3,
+    TreasuryNotSet = 4,
 }
 
 #[contract]
@@ -149,5 +154,94 @@ impl Vault {
             env.storage().persistent().set(&recipient, &amount);
         }
         recipients.len()
+    }
+
+    /// Set the trusted Treasury contract address used by `delegate_payout`.
+    /// Only the owner may set it; this is the authorization root for the
+    /// cross-contract call chain below.
+    pub fn set_treasury(env: Env, treasury: Address) -> Result<(), VaultError> {
+        let owner: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Owner)
+            .ok_or(VaultError::NotInitialized)?;
+        owner.require_auth();
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+        Ok(())
+    }
+
+    /// Return the currently configured Treasury contract address.
+    pub fn treasury(env: Env) -> Result<Address, VaultError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .ok_or(VaultError::TreasuryNotSet)
+    }
+
+    /// Cross-contract payout: the caller authorizes the Vault to spend
+    /// `amount` on their behalf, and the Vault forwards the payout
+    /// request to its trusted Treasury contract.
+    ///
+    /// This demonstrates cross-contract authorization propagation:
+    /// 1. `caller.require_auth()` — the external caller authorizes the
+    ///    Vault to act on their behalf.
+    /// 2. The Vault invokes `Treasury::payout`, which itself calls
+    ///    `vault.require_auth()` — the Treasury requires the *calling*
+    ///    contract (the Vault) to authenticate itself.
+    ///
+    /// The two `require_auth` calls form a cross-contract auth chain:
+    /// user -> Vault -> Treasury. Soroban's auth framework verifies
+    /// the whole chain in one transaction, which is the pattern this
+    /// example exists to demonstrate.
+    pub fn delegate_payout(
+        env: Env,
+        caller: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), VaultError> {
+        // The external caller must authorize the Vault to act for them.
+        caller.require_auth();
+
+        let treasury_addr: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .ok_or(VaultError::TreasuryNotSet)?;
+
+        // Forward the payout to the Treasury contract. The Treasury's
+        // own `payout` entry point will call `vault.require_auth()`,
+        // forming the second link in the auth chain.
+        let treasury_client = TreasuryClient::new(&env, &treasury_addr);
+        treasury_client.payout(&env.current_contract_address(), &recipient, &amount);
+        Ok(())
+    }
+}
+
+/// A second contract in the same example crate, used to demonstrate
+/// cross-contract authorization.
+///
+/// `Treasury` is a minimal contract that holds no balance of its own — it
+/// is a stand-in for any contract that a Vault might call as part of a
+/// payout flow. Its single entry point, `payout`, requires the *calling*
+/// contract to authenticate itself via `require_auth`, so a Vault that
+/// calls it must be an authorized caller.
+#[contract]
+pub struct Treasury;
+
+#[contractimpl]
+impl Treasury {
+    /// Pay `amount` to `recipient` on behalf of `from`.
+    ///
+    /// `from` is expected to be a contract address (the Vault). The
+    /// `from.require_auth()` call is the second link in the
+    /// cross-contract auth chain: it proves the calling contract
+    /// authorized this invocation, not just that *some* address signed.
+    pub fn payout(env: Env, from: Address, recipient: Address, amount: i128) {
+        from.require_auth();
+        // In a real contract this would transfer a token; here we just
+        // record the payout so tests can observe it.
+        env.storage()
+            .persistent()
+            .set(&(from, recipient), &amount);
     }
 }

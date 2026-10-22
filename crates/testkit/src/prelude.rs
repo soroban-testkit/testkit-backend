@@ -3,8 +3,12 @@
 
 pub use crate::auth::{AdminUserActors, AuthMatrix, OwnerActors, PeerActors, RbacActors};
 pub use crate::core::{Actor, AddressIter, TestEnv, TestFixture, TestkitError};
+pub use crate::auth::AuthMatrix;
+pub use crate::core::{
+    assert_independent, Actor, AddressIter, FixtureBuilder, TestEnv, TestFixture, TestkitError,
+};
 pub use crate::events::{CapturedEvent, EventLog};
 pub use crate::ledger::LedgerCheckpoint;
 pub use crate::money::{adversarial_amounts, amounts_in, bps_values, Conservation};
 pub use crate::tokens::TestToken;
-pub use crate::ttl::StorageKind;
+pub use crate::ttl::{SdkTtlCapabilities, StorageKind};

@@ -71,3 +71,67 @@ fn vault_batch_payout() {
     let count = client.batch_payout(&recipients, &100);
     assert_eq!(count, 2);
 }
+
+// ── Cross-contract authorization (#415) ─────────────────────────────────────
+//
+// These tests exercise the multi-contract auth chain:
+//   user -> Vault::delegate_payout -> Treasury::payout
+// where each link calls `require_auth`, and Soroban's auth framework
+// verifies the whole chain in one transaction.
+
+#[test]
+fn delegate_payout_succeeds_when_both_auth_links_are_mocked() {
+    let env = Env::default();
+
+    // Register both contracts in the same env so their addresses are valid
+    // against each other.
+    let vault_id = env.register(Vault, ());
+    let treasury_id = env.register(Treasury, ());
+    let vault_client = VaultClient::new(&env, &vault_id);
+
+    let owner = Address::generate(&env);
+    let caller = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    vault_client.initialize(&owner);
+    vault_client.set_treasury(&treasury_id);
+
+    // mock_all_auths covers both require_auth calls in the chain:
+    // caller.require_auth() in delegate_payout and
+    // vault.require_auth() in Treasury::payout.
+    env.mock_all_auths();
+    vault_client.delegate_payout(&caller, &recipient, &500);
+}
+
+#[test]
+fn set_treasury_requires_owner_auth() {
+    let env = Env::default();
+    let vault_id = env.register(Vault, ());
+    let vault_client = VaultClient::new(&env, &vault_id);
+
+    let owner = Address::generate(&env);
+    let treasury_id = env.register(Treasury, ());
+
+    vault_client.initialize(&owner);
+
+    // Without mocking auth, set_treasury must fail.
+    let result = vault_client.try_set_treasury(&treasury_id);
+    assert!(result.is_err() || matches!(result, Ok(Err(_))));
+}
+
+#[test]
+fn delegate_payout_fails_without_treasury_set() {
+    let env = Env::default();
+    let vault_id = env.register(Vault, ());
+    let vault_client = VaultClient::new(&env, &vault_id);
+
+    let owner = Address::generate(&env);
+    let caller = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    vault_client.initialize(&owner);
+    // No set_treasury call: TreasuryNotSet is expected.
+    env.mock_all_auths();
+    let result = vault_client.try_delegate_payout(&caller, &recipient, &100);
+    assert!(result.is_err() || matches!(result, Ok(Err(_))));
+}

@@ -251,3 +251,386 @@ fn expiry_simulation_preserves_unrelated_ledger_settings() {
     assert_eq!(final_ledger.protocol_version, test_protocol);
     assert_eq!(final_ledger.base_reserve, 500);
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Issue #405 — capability discovery for SDK TTL test support
+// ──────────────────────────────────────────────────────────────────────────────
+
+use soroban_testkit::ttl::{
+    ARCHIVAL_PROTOCOL_CONTRACT_LIFECYCLE, ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH,
+    ARCHIVAL_PROTOCOL_STATE_ARCHIVAL,
+};
+
+// ── Positive: capabilities match runtime ledger info ─────────────────────────
+
+#[test]
+fn ttl_capabilities_accessors_match_runtime_ledger_info() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let env = TestEnv::new();
+    let info = env.env().ledger().get();
+    let caps = env.ttl_capabilities();
+
+    assert_eq!(caps.protocol_version(), info.protocol_version);
+    assert_eq!(
+        caps.min_persistent_entry_ttl(),
+        info.min_persistent_entry_ttl
+    );
+    assert_eq!(caps.min_temp_entry_ttl(), info.min_temp_entry_ttl);
+    assert_eq!(caps.max_entry_ttl(), info.max_entry_ttl);
+}
+
+#[test]
+fn ttl_capabilities_max_ttl_bounds_are_consistent() {
+    let caps = TestEnv::new().ttl_capabilities();
+    assert!(
+        caps.max_entry_ttl() >= caps.min_persistent_entry_ttl(),
+        "max_entry_ttl must be >= min_persistent_entry_ttl"
+    );
+    assert!(
+        caps.max_entry_ttl() >= caps.min_temp_entry_ttl(),
+        "max_entry_ttl must be >= min_temp_entry_ttl"
+    );
+}
+
+// ── Positive: per-protocol capability predicates ──────────────────────────────
+
+#[test]
+fn at_soroban_launch_core_capabilities_are_available() {
+    let env = TestEnv::with_protocol_version(ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH);
+    let caps = env.ttl_capabilities();
+    assert!(
+        caps.ttl_inspection_supported(),
+        "ttl_inspection must be supported at launch"
+    );
+    assert!(
+        caps.ttl_extension_supported(),
+        "ttl_extension must be supported at launch"
+    );
+    assert!(
+        caps.persistent_archival_supported(),
+        "persistent_archival must be supported at launch"
+    );
+    assert!(
+        caps.temporary_deletion_supported(),
+        "temporary_deletion must be supported at launch"
+    );
+    assert!(
+        caps.bulk_ttl_bump_supported(),
+        "bulk_ttl_bump must be supported at launch"
+    );
+}
+
+#[test]
+fn at_soroban_launch_later_capabilities_are_absent() {
+    let env = TestEnv::with_protocol_version(ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH);
+    let caps = env.ttl_capabilities();
+    assert!(
+        !caps.contract_lifecycle_supported(),
+        "contract_lifecycle must NOT be supported at the Soroban launch protocol"
+    );
+    assert!(
+        !caps.state_archival_settings_supported(),
+        "state_archival_settings must NOT be supported at the Soroban launch protocol"
+    );
+}
+
+#[test]
+fn at_contract_lifecycle_protocol_contract_lifecycle_is_available() {
+    let env = TestEnv::with_protocol_version(ARCHIVAL_PROTOCOL_CONTRACT_LIFECYCLE);
+    let caps = env.ttl_capabilities();
+    assert!(caps.contract_lifecycle_supported());
+    // Earlier capabilities must still be present.
+    assert!(caps.ttl_inspection_supported());
+    assert!(caps.persistent_archival_supported());
+    // state_archival_settings is not yet available.
+    assert!(!caps.state_archival_settings_supported());
+}
+
+#[test]
+fn at_state_archival_protocol_all_capabilities_are_available() {
+    let env = TestEnv::with_protocol_version(ARCHIVAL_PROTOCOL_STATE_ARCHIVAL);
+    let caps = env.ttl_capabilities();
+    assert!(caps.ttl_inspection_supported());
+    assert!(caps.ttl_extension_supported());
+    assert!(caps.persistent_archival_supported());
+    assert!(caps.temporary_deletion_supported());
+    assert!(caps.contract_lifecycle_supported());
+    assert!(caps.state_archival_settings_supported());
+    assert!(caps.bulk_ttl_bump_supported());
+}
+
+// ── Positive: combination predicates ─────────────────────────────────────────
+
+#[test]
+fn full_archival_recipe_supported_at_launch_and_later() {
+    for protocol in [
+        ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH,
+        ARCHIVAL_PROTOCOL_CONTRACT_LIFECYCLE,
+        ARCHIVAL_PROTOCOL_STATE_ARCHIVAL,
+    ] {
+        let caps = TestEnv::with_protocol_version(protocol).ttl_capabilities();
+        assert!(
+            caps.full_archival_recipe_supported(),
+            "full_archival_recipe must be supported at protocol {protocol}"
+        );
+    }
+}
+
+#[test]
+fn temporary_boundary_recipe_supported_at_all_modern_protocols() {
+    for protocol in [
+        ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH,
+        ARCHIVAL_PROTOCOL_CONTRACT_LIFECYCLE,
+        ARCHIVAL_PROTOCOL_STATE_ARCHIVAL,
+    ] {
+        let caps = TestEnv::with_protocol_version(protocol).ttl_capabilities();
+        assert!(
+            caps.temporary_boundary_recipe_supported(),
+            "temporary_boundary_recipe must be supported at protocol {protocol}"
+        );
+    }
+}
+
+// ── Positive: supported / unsupported lists are complementary ────────────────
+
+#[test]
+fn supported_and_unsupported_lists_partition_all_known_capabilities() {
+    const ALL_CAPS: &[&str] = &[
+        "ttl_inspection",
+        "ttl_extension",
+        "persistent_archival",
+        "temporary_deletion",
+        "contract_lifecycle",
+        "state_archival_settings",
+        "bulk_ttl_bump",
+    ];
+    for protocol in [
+        ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH,
+        ARCHIVAL_PROTOCOL_CONTRACT_LIFECYCLE,
+        ARCHIVAL_PROTOCOL_STATE_ARCHIVAL,
+    ] {
+        let caps = TestEnv::with_protocol_version(protocol).ttl_capabilities();
+        let supported = caps.supported_capabilities();
+        let unsupported = caps.unsupported_capabilities();
+
+        for name in ALL_CAPS {
+            let in_s = supported.contains(name);
+            let in_u = unsupported.contains(name);
+            assert!(
+                in_s ^ in_u,
+                "capability {name:?} must be in exactly one list at protocol {protocol}"
+            );
+        }
+        assert_eq!(
+            supported.len() + unsupported.len(),
+            ALL_CAPS.len(),
+            "lists must cover exactly {len} capabilities at protocol {protocol}",
+            len = ALL_CAPS.len()
+        );
+    }
+}
+
+#[test]
+fn at_state_archival_unsupported_list_is_empty() {
+    let caps = TestEnv::with_protocol_version(ARCHIVAL_PROTOCOL_STATE_ARCHIVAL).ttl_capabilities();
+    let missing = caps.unsupported_capabilities();
+    assert!(
+        missing.is_empty(),
+        "unexpected unsupported capabilities: {missing:?}"
+    );
+}
+
+// ── Positive: assert_full_ttl_support passes at state-archival protocol ───────
+
+#[test]
+fn assert_full_ttl_support_passes_at_state_archival_protocol() {
+    TestEnv::with_protocol_version(ARCHIVAL_PROTOCOL_STATE_ARCHIVAL).assert_full_ttl_support();
+}
+
+// ── Positive: assert_ttl_capabilities for individual names ───────────────────
+
+#[test]
+fn assert_ttl_capabilities_passes_for_capabilities_present_at_launch() {
+    let env = TestEnv::with_protocol_version(ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH);
+    env.assert_ttl_capabilities(&[
+        "ttl_inspection",
+        "ttl_extension",
+        "persistent_archival",
+        "temporary_deletion",
+        "bulk_ttl_bump",
+    ]);
+}
+
+#[test]
+fn assert_ttl_capabilities_with_empty_slice_always_passes() {
+    TestEnv::with_protocol_version(ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH).assert_ttl_capabilities(&[]);
+}
+
+// ── Positive: Display and Clone ───────────────────────────────────────────────
+
+#[test]
+fn sdk_ttl_capabilities_display_contains_protocol_and_flags() {
+    let caps = TestEnv::new().ttl_capabilities();
+    let s = caps.to_string();
+    assert!(
+        s.contains("protocol="),
+        "Display must include protocol: {s}"
+    );
+    assert!(
+        s.contains("ttl_inspection="),
+        "Display must include ttl_inspection: {s}"
+    );
+    assert!(
+        s.contains("persistent_archival="),
+        "Display must include persistent_archival: {s}"
+    );
+    assert!(
+        s.contains("temporary_deletion="),
+        "Display must include temporary_deletion: {s}"
+    );
+    assert!(
+        s.contains("bulk_ttl_bump="),
+        "Display must include bulk_ttl_bump: {s}"
+    );
+}
+
+#[test]
+fn sdk_ttl_capabilities_clone_equals_original() {
+    let caps = TestEnv::new().ttl_capabilities();
+    assert_eq!(caps.clone(), caps);
+}
+
+#[test]
+fn two_snapshots_from_the_same_env_are_equal() {
+    let env = TestEnv::new();
+    assert_eq!(env.ttl_capabilities(), env.ttl_capabilities());
+}
+
+// ── Negative: assert_full_ttl_support fails at launch protocol ───────────────
+
+#[test]
+#[should_panic(expected = "does not support the following TTL capabilities")]
+fn assert_full_ttl_support_panics_at_soroban_launch_protocol() {
+    TestEnv::with_protocol_version(ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH).assert_full_ttl_support();
+}
+
+// ── Negative: assert_ttl_capabilities fails for missing capabilities ──────────
+
+#[test]
+#[should_panic(expected = "missing required TTL capabilities")]
+fn assert_ttl_capabilities_panics_when_contract_lifecycle_is_requested_at_launch() {
+    TestEnv::with_protocol_version(ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH)
+        .assert_ttl_capabilities(&["contract_lifecycle"]);
+}
+
+#[test]
+#[should_panic(expected = "missing required TTL capabilities")]
+fn assert_ttl_capabilities_panics_when_state_archival_settings_requested_at_launch() {
+    TestEnv::with_protocol_version(ARCHIVAL_PROTOCOL_SOROBAN_LAUNCH)
+        .assert_ttl_capabilities(&["state_archival_settings"]);
+}
+
+// ── Negative: unknown capability name produces Misuse error ──────────────────
+
+#[test]
+#[should_panic(expected = "unknown TTL capability name")]
+fn assert_ttl_capabilities_panics_on_unknown_name() {
+    TestEnv::new().assert_ttl_capabilities(&["not_a_real_capability"]);
+}
+
+// ── Edge case: capabilities are stable across ledger advance ──────────────────
+
+#[test]
+fn ttl_capabilities_are_stable_across_ledger_advance() {
+    let env = TestEnv::new();
+    let before = env.ttl_capabilities();
+    env.advance_ledgers(1_000);
+    let after = env.ttl_capabilities();
+
+    assert_eq!(before.protocol_version(), after.protocol_version());
+    assert_eq!(
+        before.min_persistent_entry_ttl(),
+        after.min_persistent_entry_ttl()
+    );
+    assert_eq!(before.max_entry_ttl(), after.max_entry_ttl());
+    assert_eq!(
+        before.ttl_inspection_supported(),
+        after.ttl_inspection_supported()
+    );
+    assert_eq!(
+        before.persistent_archival_supported(),
+        after.persistent_archival_supported()
+    );
+}
+
+// ── Edge case: capability checks compose with existing TTL assertions ─────────
+
+#[test]
+fn capability_guard_composes_with_assert_bumps_ttl() {
+    let env = TestEnv::new();
+    let caps = env.ttl_capabilities();
+
+    // Only exercise assert_bumps_ttl when the host supports TTL extension.
+    // In practice this is always true against the pinned SDK, but the
+    // guard documents the intent and makes the test forward-compatible.
+    if !caps.ttl_extension_supported() {
+        return; // capability absent — skip, not fail
+    }
+
+    let id = env.env().register(Store, ());
+    let client = StoreClient::new(env.env(), &id);
+    client.set_persistent(&symbol_short!("k"), &1);
+
+    env.assert_bumps_ttl(&id, StorageKind::Persistent, symbol_short!("k"), || {
+        // Extend the TTL directly through the storage API.
+        env.env().as_contract(&id, || {
+            env.env()
+                .storage()
+                .persistent()
+                .extend_ttl(&symbol_short!("k"), 5_000, 10_000);
+        });
+    });
+}
+
+#[test]
+fn capability_guard_composes_with_assert_recovers_after_expiry() {
+    let env = TestEnv::new();
+    let caps = env.ttl_capabilities();
+
+    if !caps.full_archival_recipe_supported() {
+        return; // archival not available — skip
+    }
+
+    let id = env.env().register(Store, ());
+    let client = StoreClient::new(env.env(), &id);
+    client.set_persistent(&symbol_short!("p"), &77);
+
+    env.assert_recovers_after_expiry(
+        &id,
+        symbol_short!("p"),
+        || client.read_persistent(&symbol_short!("p")).unwrap_or(0),
+        77,
+    );
+}
+
+#[test]
+fn capability_guard_composes_with_assert_temporary_expires() {
+    let env = TestEnv::new();
+    let caps = env.ttl_capabilities();
+
+    if !caps.temporary_deletion_supported() {
+        return; // deletion semantics not available — skip
+    }
+
+    let id = env.env().register(Store, ());
+    let client = StoreClient::new(env.env(), &id);
+    client.set_temporary(&symbol_short!("t"), &42);
+
+    env.assert_temporary_expires(
+        &id,
+        symbol_short!("t"),
+        || client.read_temporary(&symbol_short!("t")),
+        None,
+    );
+}

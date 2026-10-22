@@ -30,6 +30,10 @@ pub const MEASUREMENT_LIMITATIONS: &str =
 /// rather than ramping forever.
 pub const SEARCH_UPPER_BOUND: u32 = 1 << 24;
 
+/// Largest accepted `--jobs`. Each concurrent probe is a full child process,
+/// so the bound keeps memory and CPU use predictable.
+const MAX_PROBE_JOBS: usize = 8;
+
 /// The standardized reason a single probe did not succeed.
 ///
 /// Every failure category is reported verbatim in the human-readable summary,
@@ -304,6 +308,14 @@ pub struct LimitsArgs {
     /// infinite wait.
     #[arg(long, value_name = "SECONDS", default_value_t = 30)]
     probe_timeout: u64,
+    /// Probe up to this many ramp values at once while doubling to find the
+    /// first failing value (1 to 8, default 1 = sequential). Results are read
+    /// back in ramp order, so the reported boundary does not depend on which
+    /// probe finishes first. Binary refinement between the bounds always runs
+    /// one probe at a time. Probes past the first failure still run to completion
+    /// but are discarded, so extra work is bounded by `--jobs - 1` probes.
+    #[arg(long, value_name = "N", default_value_t = 1)]
+    jobs: usize,
     /// Compare this run's result against a baseline previously written by
     /// `--save-baseline`. Exits non-zero if the discovered ceiling
     /// regressed (a lower ramp value, or higher instructions/memory) by
@@ -412,6 +424,12 @@ pub struct ProbeArgs {
 /// the host's budget, are reported.
 pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     validate_percentage("--baseline-tolerance-pct", args.baseline_tolerance_pct)?;
+    if args.jobs == 0 || args.jobs > MAX_PROBE_JOBS {
+        return Err(CliError(format!(
+            "--jobs must be between 1 and {MAX_PROBE_JOBS} (got {})",
+            args.jobs
+        )));
+    }
 
     // Validate the configuration (function exists, ramp parameter exists,
     // every parameter's type is one this command knows how to default or
@@ -434,57 +452,9 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     let mut first_failed_probe_stderr: Option<String> = None;
     let mut hit_upper_bound = false;
 
-    let mut probe = |value: u32| -> Result<ProbeOutcome, CliError> {
-        let child = Command::new(&self_exe)
-            .arg("__limits-probe")
-            .arg("--contract")
-            .arg(&args.contract)
-            .arg("--fn")
-            .arg(&args.function)
-            .arg("--ramp")
-            .arg(&args.ramp)
-            .arg("--value")
-            .arg(value.to_string())
-            .args(
-                args.arg_values
-                    .iter()
-                    .flat_map(|value| ["--arg", value.as_str()]),
-            )
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|err| {
-                CliError(format!(
-                    "failed to spawn the isolated probe process for ramp value {value}: {err}; \
-                     verify the soroban-testkit binary is intact and re-run \
-                     ({})",
-                    ProbeFailureCategory::SpawnFailure.guidance()
-                ))
-            })?;
-        // Retain upstream's RAII cleanup on early returns and failures.
-        let mut child = ProbeChild { child };
-
-        let status = wait_with_timeout(&mut child.child, probe_timeout)?;
-        let stderr = child
-            .child
-            .stderr
-            .take()
-            .map_or(Ok(String::new()), |mut stream| {
-                use std::io::Read;
-                let mut buffer = String::new();
-                stream.read_to_string(&mut buffer).map(|_| buffer)
-            })
-            .map_err(|err| CliError(format!("failed to read probe stderr: {err}")))?;
-
-        let outcome = match status {
-            Some(status) if status.success() => ProbeOutcome::Succeeded,
-            Some(status) if status.code().is_none() => {
-                ProbeOutcome::Failed(ProbeFailureCategory::Abort)
-            }
-            Some(_) => ProbeOutcome::Failed(classify_probe_exit_stderr(&stderr)),
-            None => ProbeOutcome::Failed(ProbeFailureCategory::TimedOut),
-        };
-
+    // Folds one probe result into the run's statistics. Only called in ramp
+    // order, so the counts and the first failure's stderr match a sequential run.
+    let mut record = |value: u32, outcome: ProbeOutcome, stderr: String| {
         if let ProbeOutcome::Failed(category) = outcome {
             // A contract failure cannot establish a budget ceiling, even if
             // earlier, lower ramp values succeeded.
@@ -506,27 +476,33 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
         Ok(outcome)
     };
 
-    // Find a failing upper bound by doubling.
+    // Find a failing upper bound by doubling. Each batch holds up to `jobs`
+    // consecutive ladder values probed concurrently; results are read back in
+    // ladder order and reading stops at the first failure, so the outcome is
+    // the same as a sequential run.
     let mut last_ok: Option<u32> = None;
-    let mut low = 1u32;
     let mut high = None;
-    loop {
-        match probe(low)? {
-            ProbeOutcome::Succeeded => {
-                last_ok = Some(low);
-                match next_ramp_value(low, SEARCH_UPPER_BOUND) {
-                    Some(next) => low = next,
-                    None => {
+    let mut next = Some(1u32);
+    while let Some(start) = next {
+        let batch = ladder_batch(start, SEARCH_UPPER_BOUND, args.jobs);
+        let results = probe_batch(&self_exe, &args, &batch, probe_timeout);
+        for (value, result) in batch.into_iter().zip(results) {
+            let (outcome, stderr) = result?;
+            match record(value, outcome, stderr)? {
+                ProbeOutcome::Succeeded => {
+                    last_ok = Some(value);
+                    next = next_ramp_value(value, SEARCH_UPPER_BOUND);
+                    if next.is_none() {
                         hit_upper_bound = true;
-                        break;
                     }
                 }
-            }
-            ProbeOutcome::Failed(category) => {
-                last_failed_probe = Some(low);
-                last_failure_category = Some(category);
-                high = Some(low);
-                break;
+                ProbeOutcome::Failed(category) => {
+                    last_failed_probe = Some(value);
+                    last_failure_category = Some(category);
+                    high = Some(value);
+                    next = None;
+                    break;
+                }
             }
         }
     }
@@ -562,6 +538,11 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     let mut first_failure_category = last_failure_category;
     let mut refinement_audit = None;
     if let Some(hi_start) = high {
+        // Refinement is sequential: each midpoint depends on the previous result.
+        let mut probe = |value: u32| -> Result<ProbeOutcome, CliError> {
+            let (outcome, stderr) = spawn_probe(&self_exe, &args, value, probe_timeout)?;
+            record(value, outcome, stderr)
+        };
         let (last_success, first_failure, audit) =
             refine_upper_bound_audited(last_ok, hi_start, &mut probe)?;
         best = last_success;
@@ -639,6 +620,110 @@ pub fn run(args: LimitsArgs) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// Runs one probe in its own process and returns its classified outcome with
+/// the captured stderr. It touches no shared state, so calls may run concurrently.
+fn spawn_probe(
+    self_exe: &Path,
+    args: &LimitsArgs,
+    value: u32,
+    probe_timeout: Duration,
+) -> Result<(ProbeOutcome, String), CliError> {
+    let child = Command::new(self_exe)
+        .arg("__limits-probe")
+        .arg("--contract")
+        .arg(&args.contract)
+        .arg("--fn")
+        .arg(&args.function)
+        .arg("--ramp")
+        .arg(&args.ramp)
+        .arg("--value")
+        .arg(value.to_string())
+        .args(
+            args.arg_values
+                .iter()
+                .flat_map(|value| ["--arg", value.as_str()]),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            CliError(format!(
+                "failed to spawn the isolated probe process for ramp value {value}: {err}; \
+                 verify the soroban-testkit binary is intact and re-run \
+                 ({})",
+                ProbeFailureCategory::SpawnFailure.guidance()
+            ))
+        })?;
+    // Retain upstream's RAII cleanup on early returns and failures.
+    let mut child = ProbeChild { child };
+
+    let status = wait_with_timeout(&mut child.child, probe_timeout)?;
+    let stderr = child
+        .child
+        .stderr
+        .take()
+        .map_or(Ok(String::new()), |mut stream| {
+            use std::io::Read;
+            let mut buffer = String::new();
+            stream.read_to_string(&mut buffer).map(|_| buffer)
+        })
+        .map_err(|err| CliError(format!("failed to read probe stderr: {err}")))?;
+
+    let outcome = match status {
+        Some(status) if status.success() => ProbeOutcome::Succeeded,
+        Some(status) if status.code().is_none() => {
+            ProbeOutcome::Failed(ProbeFailureCategory::Abort)
+        }
+        Some(_) => ProbeOutcome::Failed(classify_probe_exit_stderr(&stderr)),
+        None => ProbeOutcome::Failed(ProbeFailureCategory::TimedOut),
+    };
+    Ok((outcome, stderr))
+}
+
+/// Runs `values` as concurrent probes, one thread each, and returns the results
+/// in the same order as `values`.
+fn probe_batch(
+    self_exe: &Path,
+    args: &LimitsArgs,
+    values: &[u32],
+    probe_timeout: Duration,
+) -> Vec<Result<(ProbeOutcome, String), CliError>> {
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = values
+            .iter()
+            .map(|&value| scope.spawn(move || spawn_probe(self_exe, args, value, probe_timeout)))
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker.join().unwrap_or_else(|_| {
+                    Err(CliError(
+                        "an isolated probe worker panicked; re-run with --jobs 1 to isolate \
+                         the failing probe"
+                            .to_string(),
+                    ))
+                })
+            })
+            .collect()
+    })
+}
+
+/// The next ramp values of the doubling ladder from `start`: at most `jobs`
+/// values, each the successor of the one before, stopping at `upper_bound`.
+fn ladder_batch(start: u32, upper_bound: u32, jobs: usize) -> Vec<u32> {
+    let jobs = jobs.max(1);
+    let mut batch = Vec::with_capacity(jobs);
+    let mut current = Some(start);
+    while let Some(value) = current {
+        if batch.len() == jobs {
+            break;
+        }
+        batch.push(value);
+        current = next_ramp_value(value, upper_bound);
+    }
+    batch
 }
 
 /// Shell-quote a single argument for copyable POSIX-shell guidance.
@@ -2190,6 +2275,7 @@ mod tests {
             function: "test".to_string(),
             ramp: "count".to_string(),
             probe_timeout: 30,
+            jobs: 1,
             baseline: None,
             baseline_tolerance_pct: 5.0,
             save_baseline: None,
@@ -2205,6 +2291,49 @@ mod tests {
             "expected file error, got: {}",
             err_msg
         );
+    }
+
+    // ---- #192: opt-in bounded parallel probing ----
+
+    fn args_with_jobs(jobs: usize) -> LimitsArgs {
+        LimitsArgs {
+            contract: std::path::PathBuf::from("nonexistent.wasm"),
+            function: "test".to_string(),
+            ramp: "count".to_string(),
+            probe_timeout: 30,
+            jobs,
+            baseline: None,
+            baseline_tolerance_pct: 5.0,
+            save_baseline: None,
+            export: None,
+            arg_values: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn jobs_outside_one_to_eight_is_rejected_before_loading_the_contract() {
+        for jobs in [0, MAX_PROBE_JOBS + 1] {
+            let err = run(args_with_jobs(jobs)).unwrap_err().0;
+            assert_eq!(err, format!("--jobs must be between 1 and 8 (got {jobs})"));
+        }
+    }
+
+    #[test]
+    fn ladder_batch_takes_consecutive_ladder_values_up_to_jobs() {
+        assert_eq!(ladder_batch(1, SEARCH_UPPER_BOUND, 1), vec![1]);
+        assert_eq!(ladder_batch(1, SEARCH_UPPER_BOUND, 3), vec![1, 2, 4]);
+        assert_eq!(ladder_batch(4, SEARCH_UPPER_BOUND, 2), vec![4, 8]);
+    }
+
+    #[test]
+    fn ladder_batch_stops_at_the_upper_bound() {
+        assert_eq!(ladder_batch(4, 8, 8), vec![4, 8]);
+        assert_eq!(ladder_batch(8, 8, 4), vec![8]);
+    }
+
+    #[test]
+    fn ladder_batch_is_never_empty_even_for_zero_jobs() {
+        assert_eq!(ladder_batch(2, SEARCH_UPPER_BOUND, 0), vec![2]);
     }
 
     // ---- #493: numeric ramp boundary refinement audit ----

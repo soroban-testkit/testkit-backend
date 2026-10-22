@@ -92,6 +92,101 @@ CLI.
    that names the specific expectation and the actual value observed —
    never a generic "assertion failed".
 
+## The in-process testing boundary
+
+Every test that uses `soroban-testkit` runs **entirely in the same OS
+process as `cargo test`**.  There is no network, no Stellar node, no
+Docker container, and no external process.  `soroban-sdk`'s test
+environment (`soroban_sdk::Env`) is an in-process simulator; `TestEnv`
+wraps it and adds the helpers described above.
+
+### What this means in practice
+
+- **Tests are fast and deterministic.**  A full test suite for a
+  moderately complex contract typically finishes in under a second.
+  There is nothing to boot, authenticate against, or tear down between
+  runs.
+
+- **Everything is mocked by design.**  Ledger time, token balances,
+  events, storage TTLs — all are controlled by the test through
+  `TestEnv`.  You do not need a real network to advance the clock by a
+  year or simulate a persistent-storage expiry.
+
+- **The boundary is the WASM ABI, not a network.**  Your contract
+  functions are called through the same generated client types you would
+  use in production code (`VaultClient`, etc.), but they execute against
+  the in-process simulator rather than a live ledger.
+
+### Worked example: testing a time-locked vault
+
+The following example exercises three concerns at once — auth, ledger
+time, and storage TTL — without leaving the process:
+
+```rust
+// In your contract crate's dev-dependency tree:
+// soroban-testkit = { version = "0.1", features = ["testutils"] }
+
+use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_testkit::prelude::*;
+use vault::{Vault, VaultClient};
+
+#[test]
+fn owner_cannot_withdraw_before_lock_expires() {
+    // 1. Construct an isolated in-process environment.  No network.
+    let env = TestEnv::new();
+    let contract_id = env.env().register(Vault, ());
+    let client = VaultClient::new(env.env(), &contract_id);
+
+    let owner = Address::generate(env.env());
+    client.initialize(&owner);
+    client.deposit(&1_000);
+
+    // 2. Advance ledger time without touching the clock on your machine.
+    env.advance_ledgers(10);  // fast-forward ten ledgers (~50 seconds)
+
+    // 3. Assert that auth is enforced: an unauthorized caller must fail.
+    env.assert_requires_auth(|| {
+        client.withdraw(&500);  // no mock_all_auths → must panic
+    });
+
+    // 4. Now mock the owner's signature and withdraw successfully.
+    env.env().mock_all_auths();
+    client.withdraw(&500);
+
+    // 5. Conservation: nothing was created or destroyed.
+    Conservation {
+        deposited: 1_000,
+        withdrawn: 500,
+        refunded: 0,
+        remaining: 500,
+    }
+    .assert_holds();
+}
+```
+
+Key observations:
+
+1. `TestEnv::new()` is the only setup required.  No `before_each`, no
+   fixture files, no environment variables.
+2. `env.advance_ledgers(10)` moves the in-process clock forward.  The
+   real clock on the CI machine is irrelevant.
+3. `env.assert_requires_auth(|| ...)` wraps a call that should panic
+   when auth is absent.  If the contract forgets `require_auth`, this
+   assertion fails and the test output names the missing check.
+4. `Conservation::assert_holds()` verifies that no value leaked or
+   appeared from nowhere — the most common class of bug in streaming or
+   vesting contracts.
+
+### What falls outside this boundary
+
+The in-process simulator does not model network conditions, fee markets,
+sequence-number races, or multi-transaction interactions.  For those
+scenarios, refer to `soroban-fork` (lazy mainnet/testnet forking) or the
+Stellar testnet.  The `soroban-testkit` CLI's `limits` command bridges
+one gap: it builds your contract to WASM and measures real resource
+consumption, answering "how many recipients can my batch payment handle
+before it exceeds mainnet limits?" without a live network.
+
 ## CI's shape mirrors this structure
 
 `.github/workflows/ci.yml` jobs map directly onto the guarantees this

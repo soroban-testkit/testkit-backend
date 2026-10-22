@@ -161,3 +161,117 @@ add validation coverage for the batch payout auth model
 add a line-count and coverage comparison to validation
 
 add benchmark tracking for TestEnv construction
+
+
+## Second public contract suite validation report
+
+A second validation pass, run against the contracts shipped *in this
+repository* rather than an external suite. The target is
+[`examples/vault`](examples/vault) — a deliberately buggy contract kept
+alongside the testkit so the CLI's own integration tests can exercise real
+checks against it — plus the `examples/quickstart` escrow fixture.
+
+This pass is fully self-contained: it depends on no checkout outside the
+repo and no network access. It is the basis for the repeatable script in
+`.github/scripts/run-validation.sh` (issue #414), so a contributor can
+re-run the exact checks below with one command and compare the result
+file against this section.
+
+### Setup
+
+No external dependency was added. `examples/vault` and
+`examples/quickstart` are already workspace members, and the
+`soroban-testkit` binary is built from `crates/cli`. The validation run
+boils down to:
+
+```sh
+cargo build -p soroban-testkit-cli
+cargo build -p vault --target wasm32v1-none --release
+soroban-testkit audit examples/vault/src
+soroban-testkit limits --contract target/wasm32v1-none/release/vault.wasm \
+  --fn batch_payout --ramp recipients
+soroban-testkit release-verify
+```
+
+### 1. `audit` against `examples/vault/src`
+
+`examples/vault` is deliberately buggy by design (see its module docs), so
+this is a *positive* test: the audit must find the planted defects, and
+the findings must name the right rules. Result:
+
+- `missing-require-auth` — `withdraw` takes no `Address` but the contract
+  has an owner-only path (`withdraw_checked`) that `withdraw` skips
+  entirely. Reported as expected.
+- `missing-ttl-bump` — `touch_record` reads a persistent entry without
+  extending its TTL; `touch_record_checked` is the fixed counterpart.
+  Reported as expected.
+- `unchecked-i128-arithmetic` — `deposit` and `withdraw` do `balance +
+  amount` / `balance - amount` on `i128` outside a checked context.
+  Reported as expected.
+
+A clean-file negative case (`audit crates/cli/src/commands/mod.rs`)
+produces `audit: no findings`, confirming the scanner does not emit
+false positives on code that avoids the matched patterns.
+
+**Finding**: the audit rules fire on exactly the defects they were
+written to catch, and stay silent on a clean file. No new bug was
+found in `examples/vault` — every finding corresponds to a deliberately
+planted defect that is already documented in the contract's own comments.
+
+### 2. `limits` against `vault.batch_payout`
+
+Built `vault` to `wasm32v1-none` and ran:
+
+```
+soroban-testkit limits --contract target/wasm32v1-none/release/vault.wasm \
+  --fn batch_payout --ramp recipients
+```
+
+`batch_payout` writes one persistent storage entry per recipient, so the
+ceiling is driven by the write budget rather than instruction count. The
+command reported a last successful recipient count with matching
+instruction and memory figures, and the standardized failure category for
+the first probe that exceeded the ceiling. The exact number depends on
+the current protocol parameters baked into the SDK's test environment; the
+point of recording it here is that the same number is reproducible by
+re-running `.github/scripts/run-validation.sh`, and a drift between runs
+is a signal worth investigating, not an expected variance.
+
+### 3. `release-verify` against the current workspace
+
+Ran `soroban-testkit release-verify` (the command added in issue #412)
+against the workspace as it stands on `main`. The command checks that
+both published crates inherit `version`/`repository`/`license` from
+`[workspace.package]`, that `CHANGELOG.md` has a section for the
+workspace version, and that `COMPATIBILITY.md` mentions the pinned
+`soroban-sdk`. On an unreleased tree the changelog section for the
+*current* workspace version is the bar; a tree that is not yet
+release-ready is reported as such without blocking normal development.
+
+### 4. Auth model on `examples/vault`
+
+`vault`'s privileged entry points are `withdraw` (deliberately
+unguarded), `withdraw_checked` (owner-only), and `set_record` /
+`set_temp` / `touch_record*` (unguarded by design — they are storage
+fixtures, not value-moving entry points). The deliberately missing auth
+check on `withdraw` is the exact case `AuthMatrix::assert_enforced` is
+built to catch, and it is already exercised by the testkit's own test
+suite against the fixed `withdraw_checked` counterpart. No additional
+finding beyond what `audit` already reports.
+
+### What this second pass did not cover
+
+- **No conservation check was run against `vault`.** `vault`'s
+  `deposit`/`withdraw` move no real token — `balance` is a plain
+  `i128` in instance storage, not a SAC balance — so
+  `Conservation::assert_holds` has nothing to conserve against. The
+  conservation check is demonstrated against the `quickstart` escrow
+  example, which does move real SAC tokens.
+- **`quickstart` is exercised by its own inline test suite** (see
+  `examples/quickstart/src/lib.rs`), not by a separate validation run
+  here. Its tests already cover deposit/release/refund, event
+  assertions, conservation, and `AuthMatrix` against a deliberately
+  unguarded `withdraw_unchecked`.
+- **The exact `limits` ceiling number is not pinned in this document.**
+  It is a function of the SDK's current protocol parameters and would
+  go stale silently; the repeatable script records it per-run instead.

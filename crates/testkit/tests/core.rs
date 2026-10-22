@@ -218,3 +218,148 @@ fn token_admin_is_distinct_from_all_testenv_generated_addresses() {
         );
     }
 }
+
+// ── Issue #392: Deterministic environment metadata for failure reports ──
+
+#[test]
+fn failure_report_contains_deterministic_metadata() {
+    use soroban_testkit::core::TestEnv;
+
+    let env = TestEnv::with_seed(42);
+    let meta = env.metadata();
+    let report = meta.to_failure_report();
+
+    assert!(report.contains("deterministic environment metadata:"));
+    assert!(report.contains("ledger_timestamp: 0"));
+    assert!(report.contains("ledger_sequence: 0"));
+    assert!(report.contains("env_seed: 42"));
+
+    let env_report = env.failure_report("assertion failed: invalid invariant");
+    assert!(env_report.contains("assertion failed: invalid invariant"));
+    assert!(env_report.contains("env_seed: 42"));
+
+    let err = TestkitError::assertion_failed("unauthorized caller")
+        .with_env_metadata(&meta);
+    assert!(err.to_string().contains("environment metadata: [timestamp=0, sequence=0, seed=42]"));
+
+    let err_report = err.to_failure_report(&meta);
+    assert!(err_report.contains("unauthorized caller"));
+    assert!(err_report.contains("env_seed: 42"));
+}
+
+// ── Issue #393: Reusable fixture builder for contract setup ──
+
+#[test]
+fn fixture_builder_constructs_configured_environment() {
+    use soroban_testkit::core::{FixtureBuilder, TestEnv, TestFixture};
+
+    let env: TestEnv = FixtureBuilder::new()
+        .seed(77)
+        .timestamp(500_000)
+        .sequence_number(1234)
+        .close_interval(10)
+        .with_account_label("alice")
+        .with_account_label("bob")
+        .build();
+
+    assert_eq!(env.seed(), 77);
+    assert_eq!(env.now(), 500_000);
+    assert_eq!(env.sequence(), 1234);
+    assert_eq!(env.ledger_close_interval(), 10);
+    assert!(env.address_for_label("alice").is_some());
+    assert!(env.address_for_label("bob").is_some());
+
+    // From trait builder
+    let env2 = TestEnv::builder().seed(88).build();
+    assert_eq!(env2.seed(), 88);
+
+    // Direct helper constructor
+    let env3 = TestEnv::fixture_builder().seed(99).build();
+    assert_eq!(env3.seed(), 99);
+}
+
+#[test]
+fn fixture_builder_rejects_invalid_configurations() {
+    use soroban_testkit::core::FixtureBuilder;
+
+    // Zero close interval is invalid
+    let err_interval = FixtureBuilder::new()
+        .close_interval(0)
+        .try_build();
+    assert!(err_interval.is_err());
+    assert!(err_interval.unwrap_err().is_misuse());
+
+    // Empty or whitespace label is invalid
+    let err_label = FixtureBuilder::new()
+        .with_account_label("   ")
+        .try_build();
+    assert!(err_label.is_err());
+    assert!(err_label.unwrap_err().is_misuse());
+}
+
+// ── Issue #394: Explicit reset semantics for seeded generators ──
+
+#[test]
+fn generator_reset_reproduces_identical_stream() {
+    use soroban_testkit::core::TestEnv;
+
+    let env = TestEnv::with_seed(31415);
+    assert_eq!(env.generator_position(), 0);
+
+    let first_round = env.addresses(5);
+    assert_eq!(env.generator_position(), 5);
+
+    // Reset back to start
+    env.reset_generator();
+    assert_eq!(env.generator_position(), 0);
+
+    let second_round = env.addresses(5);
+    assert_eq!(first_round, second_round);
+
+    // Try reset helper
+    assert!(env.try_reset_generator().is_ok());
+    assert_eq!(env.generator_position(), 0);
+
+    // Position reset
+    assert!(env.try_reset_generator_to(2).is_ok());
+    assert_eq!(env.generator_position(), 2);
+    let third_addr = env.address();
+    assert_eq!(third_addr, first_round[2]);
+
+    // Negative case: u64::MAX boundary fails cleanly
+    let err = env.try_reset_generator_to(u64::MAX).unwrap_err();
+    assert!(err.is_misuse());
+    assert!(err.to_string().contains("exhausted position"));
+
+    // AddressIter reset semantics
+    let mut iter = env.address_iter();
+    iter.reset();
+    assert_eq!(iter.position(), 0);
+    let iter_first = iter.next().unwrap();
+    assert_eq!(iter_first, first_round[0]);
+    assert_eq!(iter.position(), 1);
+
+    iter.reset();
+    assert_eq!(iter.position(), 0);
+    assert_eq!(iter.next().unwrap(), first_round[0]);
+}
+
+// ── Issue #395: Assert independent TestEnv instances ──
+
+#[test]
+fn assert_independent_verifies_isolation() {
+    use soroban_testkit::core::{assert_independent, check_independent, TestEnv};
+
+    let a = TestEnv::new();
+    let b = TestEnv::new();
+
+    // Positive case: independent instances
+    assert_independent(&a, &b);
+    a.assert_independent(&b);
+    assert!(check_independent(&a, &b).is_ok());
+
+    // Negative case: same instance is not independent
+    let err = check_independent(&a, &a).unwrap_err();
+    assert!(err.is_assertion_failed());
+    assert!(err.to_string().contains("same TestEnv instance"));
+}

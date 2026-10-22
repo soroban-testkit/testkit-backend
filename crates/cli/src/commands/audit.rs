@@ -1160,6 +1160,72 @@ fn has_enforced_require_auth(block: &syn::Block) -> bool {
     visitor.has_enforced_auth
 }
 
+/// Returns `true` when the function body contains a call to a helper whose
+/// name conventionally signals that it handles authentication or
+/// authorization on behalf of the caller (e.g. `check_auth`, `verify_auth`,
+/// `assert_authorized`, `require_caller`).  These are heuristic patterns:
+/// the check avoids false positives for the common idiom of extracting the
+/// `require_auth` call into a shared helper so it cannot be silently omitted
+/// at new call sites.
+///
+/// The rule is intentionally conservative: only function/method calls whose
+/// callee name *contains* one of the recognised stems (case-insensitive) are
+/// treated as delegated auth.  A call to `check_balance` would not qualify;
+/// only calls whose name overlaps with the auth-semantics vocabulary do.
+fn calls_auth_helper(block: &syn::Block) -> bool {
+    struct AuthHelperVisitor {
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for AuthHelperVisitor {
+        fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+            let name = node.method.unraw().to_string();
+            if callee_looks_like_auth_helper(&name) {
+                self.found = true;
+            }
+            visit::visit_expr_method_call(self, node);
+        }
+
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let Expr::Path(path) = &*node.func {
+                if let Some(last) = path.path.segments.last() {
+                    let name = last.ident.unraw().to_string();
+                    if callee_looks_like_auth_helper(&name) {
+                        self.found = true;
+                    }
+                }
+            }
+            visit::visit_expr_call(self, node);
+        }
+    }
+
+    let mut visitor = AuthHelperVisitor { found: false };
+    visitor.visit_block(block);
+    visitor.found
+}
+
+/// Stems that, when present in a callee name, indicate the callee is
+/// responsible for verifying the caller's identity or permission.
+const AUTH_HELPER_STEMS: &[&str] = &[
+    "require_auth",
+    "check_auth",
+    "verify_auth",
+    "assert_auth",
+    "ensure_auth",
+    "validate_auth",
+    "assert_authorized",
+    "check_authorized",
+    "verify_caller",
+    "require_caller",
+    "assert_caller",
+    "check_caller",
+];
+
+fn callee_looks_like_auth_helper(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    AUTH_HELPER_STEMS.iter().any(|stem| lower.contains(stem))
+}
+
 /// True only for cfg predicates that *require* `test` to be enabled.
 /// `cfg(any(test, feature = "x"))` is not test-only: it can ship in production.
 fn cfg_requires_test(meta: &syn::Meta) -> bool {
@@ -1280,9 +1346,19 @@ impl FunctionVisitor<'_> {
         let name = sig.ident.to_string();
 
         // Rule 1: an Address parameter that's never checked with require_auth.
+        //
+        // Two sources of evidence are accepted to avoid false positives:
+        //   (a) a direct `require_auth` / `require_auth_for_args` call anywhere
+        //       in the function body (possibly via `Address::require_auth(&addr)`),
+        //   (b) a call to a helper function whose name contains a recognised
+        //       auth-semantics stem (e.g. `check_auth`, `verify_caller`) — the
+        //       common pattern of extracting auth into a shared helper.
         if self.is_enabled("missing-require-auth") {
             let address_params = address_typed_params(sig);
-            if !address_params.is_empty() && !has_enforced_require_auth(block) {
+            if !address_params.is_empty()
+                && !has_enforced_require_auth(block)
+                && !calls_auth_helper(block)
+            {
                 self.push_with_range(
                     line,
                     "missing-require-auth",
@@ -1823,6 +1899,83 @@ mod tests {
         assert!(!findings
             .iter()
             .any(|finding| finding.rule == "missing-require-auth"));
+    }
+
+    #[test]
+    fn helper_function_performing_auth_suppresses_false_positive() {
+        // The entry point delegates require_auth to a helper — a very common
+        // pattern for sharing auth logic across entry points.  The scanner
+        // must not flag the entry point as missing auth.
+        let findings = audit_source_for_test(
+            r#"
+            fn check_auth(caller: &Address) {
+                caller.require_auth();
+            }
+
+            #[contractimpl]
+            impl Contract {
+                pub fn withdraw(env: Env, from: Address) {
+                    check_auth(&from);
+                    let balance: i128 = env.storage().instance().get(&"bal").unwrap_or(0);
+                    env.storage().instance().set(&"bal", &(balance - 1));
+                }
+            }
+            "#,
+        );
+        assert!(
+            !findings.iter().any(|f| f.rule == "missing-require-auth"),
+            "false positive: entry point delegates to check_auth helper but was still flagged; \
+             findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn auth_helper_stems_are_recognised_for_various_naming_conventions() {
+        // Covers verify_auth, assert_authorized, require_caller, etc.
+        for helper_call in &[
+            "verify_auth(&from);",
+            "assert_authorized(&from);",
+            "require_caller(&from);",
+            "self.verify_caller(&from);",
+            "ctx.check_auth(&from);",
+        ] {
+            let source = format!(
+                r#"
+                #[contractimpl]
+                impl Contract {{
+                    pub fn transfer(env: Env, from: Address) {{
+                        {helper_call}
+                    }}
+                }}
+                "#
+            );
+            let findings = audit_source_for_test(&source);
+            assert!(
+                !findings.iter().any(|f| f.rule == "missing-require-auth"),
+                "false positive for helper call `{helper_call}`; findings: {findings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_helper_call_does_not_suppress_missing_auth_finding() {
+        // Calling a helper named `process_payment` must NOT suppress the
+        // missing-require-auth finding; only auth-semantics helpers qualify.
+        let findings = audit_source_for_test(
+            r#"
+            #[contractimpl]
+            impl Contract {
+                pub fn withdraw(env: Env, from: Address) {
+                    process_payment(&from);
+                }
+            }
+            "#,
+        );
+        assert!(
+            findings.iter().any(|f| f.rule == "missing-require-auth"),
+            "missing-require-auth should still fire when only an unrelated helper is called; \
+             findings: {findings:?}"
+        );
     }
 
     #[test]

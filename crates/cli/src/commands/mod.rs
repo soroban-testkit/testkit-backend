@@ -2,11 +2,12 @@ pub mod audit;
 pub mod completion;
 pub mod coverage;
 pub mod limits;
+pub mod release_verify;
 
 use clap::{Parser, Subcommand};
 
-/// soroban-testkit: coverage, resource-limit discovery, and static audit
-/// checks for Soroban contracts.
+/// soroban-testkit: coverage, resource-limit discovery, static audit checks,
+/// and release metadata verification for Soroban contracts.
 #[derive(Parser)]
 #[command(name = "soroban-testkit", version, about)]
 pub struct Cli {
@@ -24,6 +25,9 @@ pub enum Commands {
     Audit(audit::AuditArgs),
     /// Generate shell completions for this CLI.
     Completion(completion::CompletionArgs),
+    /// Verify that workspace crate metadata is consistent and release-ready
+    /// against the supplied (or workspace) version.
+    ReleaseVerify(release_verify::ReleaseVerifyArgs),
     /// Hidden: runs a single limits probe in its own process. See
     /// `limits::run`'s doc comment for why.
     #[command(name = "__limits-probe", hide = true)]

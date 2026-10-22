@@ -13,8 +13,15 @@
 //! Basis-point *fractions* ([`bps_values`]) are the one unsigned case: a
 //! fraction is a [`u32`] (`10_000` bps = 100%) and cannot be negative.
 
+mod conversions;
 mod generators;
 mod invariants;
+mod rounding;
 
+pub use conversions::{
+    assert_in_range, assert_roundtrip, from_stroops, stroops_to_decimal_string, to_stroops,
+    to_stroops_with_decimals, STELLAR_DECIMALS, STELLAR_SCALE,
+};
 pub use generators::{adversarial_amounts, amounts_in, bps_values, overflow_edge_triples};
 pub use invariants::{assert_conserved_over, Conservation};
+pub use rounding::{assert_rounding, assert_split_conserved, RoundingPolicy};

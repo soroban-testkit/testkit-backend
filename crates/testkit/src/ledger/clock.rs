@@ -602,6 +602,59 @@ impl TestEnv {
         Ok(())
     }
 
+    /// Advance the ledger clock to the next close time.
+    ///
+    /// Computes the remaining time until the next ledger close boundary and
+    /// advances by exactly that amount, landing on the next close. If the
+    /// clock is already at a close boundary, advances by one full close
+    /// interval (i.e., the next close is one interval later, not the current
+    /// instant).
+    ///
+    /// The returned value is the number of seconds actually advanced.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let before = env.now();
+    /// let advanced = env.advance_to_next_close();
+    /// assert!(advanced > 0);
+    /// assert_eq!(env.now(), before + advanced);
+    /// ```
+    pub fn advance_to_next_close(&self) -> u64 {
+        self.try_advance_to_next_close().unwrap_or_else(|e| panic!("{}", e))
+    }
+
+    /// Attempt to advance the ledger clock to the next close time.
+    ///
+    /// Returns the number of seconds advanced, or a [`TestkitError::Misuse`]
+    /// if the advance would overflow ledger arithmetic. The clock is left
+    /// unchanged on error.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use soroban_testkit::core::TestEnv;
+    ///
+    /// let env = TestEnv::new();
+    /// let before = env.now();
+    /// let advanced = env.try_advance_to_next_close().expect("advance should succeed");
+    /// assert_eq!(env.now(), before + advanced);
+    /// ```
+    pub fn try_advance_to_next_close(&self) -> Result<u64, TestkitError> {
+        let interval = self.ledger_close_interval();
+        let elapsed = self.now() % interval;
+        let remaining = if elapsed == 0 {
+            interval
+        } else {
+            interval - elapsed
+        };
+        self.try_advance_secs(remaining)?;
+        Ok(remaining)
+    }
+
     /// Jump to an absolute unix timestamp, advancing the sequence in
     /// proportion to the elapsed time.
     ///
@@ -1985,5 +2038,62 @@ mod tests {
         let before = env.checkpoint();
         env.advance(Duration::from_secs(1));
         assert_ne!(env.checkpoint(), before);
+    }
+
+    // --- advance_to_next_close (#399) -----------------------------------
+
+    #[test]
+    fn advance_to_next_close_lands_on_a_close_boundary() {
+        let env = TestEnv::new().with_ledger_close_interval(5);
+        env.advance(Duration::from_secs(3)); // not on a boundary
+        let before = env.now();
+
+        env.advance_to_next_close();
+
+        assert_eq!(env.now() % 5, 0, "must land on a close boundary");
+        assert!(env.now() > before);
+    }
+
+    #[test]
+    fn advance_to_next_close_from_a_boundary_advances_one_full_interval() {
+        let env = TestEnv::new().with_ledger_close_interval(5);
+        // Start at t=0 (a boundary), advance to next close
+        let before = env.now();
+        let advanced = env.advance_to_next_close();
+
+        assert_eq!(advanced, 5, "from a boundary, advance one full interval");
+        assert_eq!(env.now(), before + 5);
+    }
+
+    #[test]
+    fn advance_to_next_close_advances_by_the_remainder() {
+        let env = TestEnv::new().with_ledger_close_interval(10);
+        env.advance(Duration::from_secs(7)); // 7 % 10 = 7, remainder = 3
+        let before = env.now();
+
+        let advanced = env.advance_to_next_close();
+
+        assert_eq!(advanced, 3);
+        assert_eq!(env.now(), before + 3);
+    }
+
+    #[test]
+    fn advance_to_next_close_respects_custom_interval() {
+        let env = TestEnv::new().with_ledger_close_interval(3);
+        env.advance(Duration::from_secs(1)); // 1 % 3 = 1, remainder = 2
+        let before = env.now();
+
+        env.advance_to_next_close();
+
+        assert_eq!(env.now(), before + 2);
+        assert_eq!(env.now() % 3, 0);
+    }
+
+    #[test]
+    fn try_advance_to_next_close_succeeds() {
+        let env = TestEnv::new();
+        let result = env.try_advance_to_next_close();
+        assert!(result.is_ok());
+        assert!(result.unwrap() > 0);
     }
 }
