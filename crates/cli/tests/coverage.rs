@@ -39,6 +39,7 @@ fn coverage_help_documents_options_and_platform_notes() {
     assert!(stdout.contains("--exclude-generated"), "{stdout}");
     assert!(stdout.contains("--ignore-filename-regex"), "{stdout}");
     assert!(stdout.contains("--no-clean"), "{stdout}");
+    assert!(stdout.contains("--branch"), "{stdout}");
 }
 
 #[test]
@@ -58,7 +59,7 @@ fn output_option_rejected_for_non_json_formats() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--output is only valid with --format json"),
+        stderr.contains("--output is only valid with --format json or lcov"),
         "{stderr}"
     );
 
@@ -66,7 +67,7 @@ fn output_option_rejected_for_non_json_formats() {
     assert!(!output_lcov.status.success());
     let stderr_lcov = String::from_utf8_lossy(&output_lcov.stderr);
     assert!(
-        stderr_lcov.contains("--output is only valid with --format json"),
+        stderr_lcov.contains("--output is only valid with --format json or lcov"),
         "{stderr_lcov}"
     );
 }
@@ -126,7 +127,8 @@ fn format_names_are_consistent_in_errors_and_help() {
     assert!(!output_text_out.status.success());
     let stderr_text = String::from_utf8_lossy(&output_text_out.stderr);
     assert!(
-        stderr_text.contains("--output is only valid with --format json (got --format text)"),
+        stderr_text
+            .contains("--output is only valid with --format json or lcov (got --format text)"),
         "{stderr_text}"
     );
 
@@ -160,7 +162,7 @@ fn json_output_flag_rejected_before_tool_is_spawned() {
     assert!(!out.status.success(), "expected non-zero exit");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("--output is only valid with --format json"),
+        stderr.contains("--output is only valid with --format json or lcov"),
         "expected actionable error message, got: {stderr}"
     );
 
@@ -169,7 +171,7 @@ fn json_output_flag_rejected_before_tool_is_spawned() {
     assert!(!out_lcov.status.success(), "expected non-zero exit");
     let stderr_lcov = String::from_utf8_lossy(&out_lcov.stderr);
     assert!(
-        stderr_lcov.contains("--output is only valid with --format json"),
+        stderr_lcov.contains("--output is only valid with --format json or lcov"),
         "{stderr_lcov}"
     );
 
@@ -178,7 +180,7 @@ fn json_output_flag_rejected_before_tool_is_spawned() {
     assert!(!out_html.status.success(), "expected non-zero exit");
     let stderr_html = String::from_utf8_lossy(&out_html.stderr);
     assert!(
-        stderr_html.contains("--output is only valid with --format json"),
+        stderr_html.contains("--output is only valid with --format json or lcov"),
         "{stderr_html}"
     );
 }
@@ -196,7 +198,7 @@ fn cli_never_claims_success_on_argument_validation_failure() {
         // --output with non-json format
         (
             &["coverage", "--format", "text", "--output", "x.json"],
-            "--output is only valid with --format json",
+            "--output is only valid with --format json or lcov",
         ),
         // --open with json format
         (
@@ -303,7 +305,7 @@ fn json_format_arg_validation_guards_augmentation_path() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("--output is only valid with --format json"),
+        stderr.contains("--output is only valid with --format json or lcov"),
         "expected actionable error for JSON output path guard: {stderr}"
     );
 
