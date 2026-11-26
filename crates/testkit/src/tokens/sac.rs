@@ -25,6 +25,21 @@ const SAC_DECIMALS: u32 = 7;
 /// mocking enabled. Every other operation (transfers, burns, approvals) still
 /// needs the test to authorize the caller with `mock_all_auths` or a per-call
 /// `mock_auths`; see [`crate::tokens`] for the same rule stated module-wide.
+///
+/// # Ownership and Clone semantics
+///
+/// `TestToken` represents a stateful test double handle that owns local supply- and
+/// holder-tracking metadata ([`TestToken::total_tracked`], [`TestToken::tracked_holders`])
+/// alongside the contract address and administrative identity.
+///
+/// `TestToken` intentionally does **not** implement [`Clone`]:
+/// - Cloning the handle would duplicate internal tracking cells ([`std::cell::Cell`] and
+///   [`std::cell::RefCell`]) independently, causing supply accounting and tracked holder
+///   records to diverge while interacting with the exact same underlying contract on the host.
+/// - Ledger state (balances, allowances, authorized mints) lives on the host [`Env`]
+///   and is shared by all callers using [`TestToken::address`].
+/// - Test fixtures, assertions, and helper functions should borrow `&TestToken`.
+///   When distinct tokens are needed, deploy them via [`TestEnv::token`] or [`TestEnv::token_set`].
 pub struct TestToken {
     env: Env,
     address: Address,
@@ -271,7 +286,7 @@ impl TestToken {
     /// # Panics
     ///
     /// Panics with a [`TestkitError::AssertionFailed`] showing the expected
-    /// and actual balances if they differ.
+    /// and actual balances and the token address if they differ.
     ///
     /// # Example
     ///
@@ -288,10 +303,11 @@ impl TestToken {
     pub fn assert_balance(&self, of: &Address, expected: i128) {
         let actual = self.balance(of);
         if actual != expected {
+            let token_addr = self.address();
             panic!(
                 "{}",
                 TestkitError::AssertionFailed(format!(
-                    "expected balance of {of:?} to be {expected}, found {actual}"
+                    "expected balance of {of:?} for token {token_addr:?} to be {expected}, found {actual}"
                 ))
             );
         }
@@ -978,10 +994,11 @@ impl TestToken {
             );
         });
         if delta != expected_delta {
+            let token_addr = self.address();
             panic!(
                 "{}",
                 TestkitError::AssertionFailed(format!(
-                    "expected the call to change balance of {of:?} by {expected_delta} base units, \
+                    "expected the call to change balance of {of:?} for token {token_addr:?} by {expected_delta} base units, \
                      but it went from {before} to {after} (delta={delta})"
                 ))
             );
@@ -1089,10 +1106,11 @@ impl TestToken {
                 );
             });
             if delta != expected_delta {
+                let token_addr = self.address();
                 panic!(
                     "{}",
                     TestkitError::AssertionFailed(format!(
-                        "expected the call to change balance of {addr:?} by {expected_delta} base units, \
+                        "expected the call to change balance of {addr:?} for token {token_addr:?} by {expected_delta} base units, \
                          but it went from {before_bal} to {after_bal} (delta={delta})"
                     ))
                 );
@@ -3930,6 +3948,90 @@ mod tests {
         tokens.assert_balances(&alice, [("DAI", 0)]);
     }
 
+ fix/tokens-sac-improvements
+    // ── Issue #133: include token address in balance assertion failures ──
+
+    #[test]
+    fn assert_balance_failure_message_includes_token_address() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let token_addr = token.address();
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            token.assert_balance(&alice, 500);
+        }));
+
+        let err = res.expect_err("assert_balance should panic on mismatch");
+        let msg = if let Some(s) = err.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = err.downcast_ref::<&str>() {
+            s.to_string()
+        } else {
+            panic!("unexpected panic payload type");
+        };
+
+        assert!(msg.contains(&format!("{alice:?}")));
+        assert!(msg.contains(&format!("{token_addr:?}")));
+        assert!(msg.contains("expected balance of"));
+        assert!(msg.contains("500"));
+        assert!(msg.contains("found 0"));
+    }
+
+    #[test]
+    fn assert_balance_whole_failure_message_includes_token_address() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let token_addr = token.address();
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            token.assert_balance_whole(&alice, 10);
+        }));
+
+        let err = res.expect_err("assert_balance_whole should panic on mismatch");
+        let msg = if let Some(s) = err.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = err.downcast_ref::<&str>() {
+            s.to_string()
+        } else {
+            panic!("unexpected panic payload type");
+        };
+
+        assert!(msg.contains(&format!("{alice:?}")));
+        assert!(msg.contains(&format!("{token_addr:?}")));
+        assert!(msg.contains("expected balance of"));
+    }
+
+    #[test]
+    fn assert_balance_delta_failure_message_includes_token_address() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        let token_addr = token.address();
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            token.assert_balance_delta(&alice, 100, || {});
+        }));
+
+        let err = res.expect_err("assert_balance_delta should panic on mismatch");
+        let msg = if let Some(s) = err.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = err.downcast_ref::<&str>() {
+            s.to_string()
+        } else {
+            panic!("unexpected panic payload type");
+        };
+
+        assert!(msg.contains(&format!("{alice:?}")));
+        assert!(msg.contains(&format!("{token_addr:?}")));
+    }
+
+    // ── Issue #132: TestToken clone and ownership semantics ──
+
+    #[test]
+    fn test_token_ownership_and_borrowing_semantics() {
+
     // ── Issue #137: raw-balance assertion naming explicitly ──
 
     #[test]
@@ -4014,10 +4116,86 @@ mod tests {
 
     #[test]
     fn try_transfer_returns_err_when_authorization_missing() {
+ main
         let env = TestEnv::new();
         let token = env.token();
         let alice = env.address();
         let bob = env.address();
+
+ fix/tokens-sac-improvements
+        // Pass token double by reference across helpers
+        fn helper_mint(t: &TestToken, to: &Address, whole: i128) {
+            t.mint(to, whole);
+        }
+
+        helper_mint(&token, &alice, 10);
+        helper_mint(&token, &bob, 20);
+
+        assert_eq!(token.tracked_holder_count(), 2);
+        assert_eq!(token.total_tracked(), 300_000_000);
+        token.assert_balance_whole(&alice, 10);
+        token.assert_balance_whole(&bob, 20);
+    }
+
+    // ── Issue #130: test maximum supported decimal precision ──
+
+    #[test]
+    fn maximum_supported_decimal_precision_for_stellar_asset_contract() {
+        let env = TestEnv::new();
+        let token = env.token();
+        assert_eq!(token.decimals(), 7);
+
+        let explicit_token = env.token_with_decimals(7);
+        assert_eq!(explicit_token.decimals(), 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "Stellar Asset Contracts fix decimals at 7")]
+    fn token_with_decimals_rejects_greater_than_seven() {
+        let env = TestEnv::new();
+        let _ = env.token_with_decimals(8);
+    }
+
+    #[test]
+    #[should_panic(expected = "Stellar Asset Contracts fix decimals at 7")]
+    fn token_with_decimals_rejects_u32_max() {
+        let env = TestEnv::new();
+        let _ = env.token_with_decimals(u32::MAX);
+    }
+
+    #[test]
+    fn maximum_supported_decimal_precision_for_unit_conversions() {
+        // 10^38 fits within i128 (i128::MAX is ~1.7e38), 10^39 overflows i128.
+        let max_precision = 38;
+        let scale_38 = whole_to_base_units(1, max_precision).expect("38 decimals fits in i128");
+        assert_eq!(scale_38, 10i128.pow(max_precision));
+
+        let whole = base_to_whole_units(scale_38, max_precision).expect("round trip base to whole");
+        assert_eq!(whole, 1);
+
+        let exact = base_to_whole_units_exact(scale_38, max_precision).expect("exact base to whole");
+        assert_eq!(exact, 1);
+
+        // 39 decimals overflows i128
+        let err_whole = whole_to_base_units(1, 39).expect_err("39 decimals overflows i128");
+        assert!(err_whole.is_misuse());
+        assert!(err_whole.message().contains("decimal precision 39 is too large"));
+
+        let err_base = base_to_whole_units(1, 39).expect_err("39 decimals overflows i128");
+        assert!(err_base.is_misuse());
+
+        let err_exact = base_to_whole_units_exact(1, 39).expect_err("39 decimals overflows i128");
+        assert!(err_exact.is_misuse());
+
+        // u32::MAX does not panic and reports misuse cleanly
+        let err_u32_max = whole_to_base_units(1, u32::MAX).expect_err("u32::MAX overflows");
+        assert!(err_u32_max.is_misuse());
+    }
+
+    // ── Issue #129: test zero and negative mint behavior explicitly ──
+
+    #[test]
+    fn test_zero_mint_behavior_explicit() {
 
         token.mint_raw(&alice, 100);
 
@@ -4133,10 +4311,78 @@ mod tests {
 
     #[test]
     fn try_approve_returns_ok_on_success() {
+ main
         let env = TestEnv::new();
         let token = env.token();
         let alice = env.address();
         let bob = env.address();
+ fix/tokens-sac-improvements
+        let carol = env.address();
+        let dave = env.address();
+
+        // Minting 0 whole units
+        token.mint(&alice, 0);
+        token.assert_balance(&alice, 0);
+        assert_eq!(token.total_tracked(), 0);
+        assert!(token.is_tracked_holder(&alice));
+
+        // Minting 0 base units
+        token.mint_raw(&bob, 0);
+        token.assert_balance(&bob, 0);
+        assert_eq!(token.total_tracked(), 0);
+        assert!(token.is_tracked_holder(&bob));
+
+        // Fallible try_mint variants succeed for 0
+        assert!(token.try_mint(&carol, 0).is_ok());
+        token.assert_balance(&carol, 0);
+        assert!(token.is_tracked_holder(&carol));
+
+        assert!(token.try_mint_raw(&dave, 0).is_ok());
+        token.assert_balance(&dave, 0);
+        assert!(token.is_tracked_holder(&dave));
+    }
+
+    #[test]
+    fn test_negative_mint_rejected_without_modifying_state() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+
+        let err_raw = token
+            .try_mint_raw(&alice, -1)
+            .expect_err("negative mint_raw must fail");
+        assert!(err_raw.is_misuse());
+        assert!(err_raw.message().contains("cannot mint negative amount -1"));
+
+        let err_whole = token
+            .try_mint(&alice, -5)
+            .expect_err("negative try_mint must fail");
+        assert!(err_whole.is_misuse());
+        assert!(err_whole.message().contains("cannot mint negative amount"));
+
+        // Tracking state remains unchanged
+        assert_eq!(token.total_tracked(), 0);
+        assert!(!token.is_tracked_holder(&alice));
+        assert_eq!(token.tracked_holder_count(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot mint negative amount -1")]
+    fn mint_raw_panics_on_negative_amount() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        token.mint_raw(&alice, -1);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot mint negative amount")]
+    fn mint_panics_on_negative_amount() {
+        let env = TestEnv::new();
+        let token = env.token();
+        let alice = env.address();
+        token.mint(&alice, -10);
+
 
         token.mint_raw(&alice, 200);
         env.env().mock_all_auths_allowing_non_root_auth();
@@ -4233,5 +4479,6 @@ mod tests {
         token.assert_allowance(&alice, &carol, 200);
         assert_eq!(token.allowance(&alice, &bob), 100);
         assert_eq!(token.allowance(&alice, &carol), 200);
+ main
     }
 }
